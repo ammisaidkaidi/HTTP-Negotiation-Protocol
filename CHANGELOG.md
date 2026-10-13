@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-10-13
+
+### Added
+
+- Authentication in `src/auth/` (`common.ts`, `client.ts`, `server.ts`,
+  exported as `http-negotiation-protocol/auth`): `ServerAuthManager`
+  (alias `AuthManager`) and `ClientAuthManager` (alias `ClientAuth`)
+  implementing begin -> 50 ms time sync (many fast requests, both sides
+  enforce the skew budget) -> uid request (per-user password lookup) ->
+  challenge encrypted with AES-256-GCM under HKDF(password, time\50),
+  where the challenge is a list of built-in pure function names applied
+  to a random input -> encrypted answer -> server-side validation ->
+  token saved to the server registry *before* being sent -> ack ->
+  handshake closed; a closed/expired session requires a fresh auth
+  process. Includes HTTP hosting (`listen`/`attach`/`requestHandler`, a
+  transport-agnostic `handleAuthMessage`), `validateToken`/`revokeToken`,
+  tests, and `examples/auth.ts`.
+
 ## [1.8.0] - 2026-10-13
 
 ### Added

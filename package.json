@@ -1,6 +1,6 @@
 {
   "name": "http-negotiation-protocol",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "A minimal TypeScript HTTP request-negotiation protocol with client services and external callbacks.",
   "type": "module",
   "license": "MIT",
@@ -31,6 +31,10 @@
       "types": "./dist/protocol.d.ts",
       "import": "./dist/protocol.js"
     },
+    "./auth": {
+      "types": "./dist/auth/index.d.ts",
+      "import": "./dist/auth/index.js"
+    },
     "./package.json": "./package.json"
   },
   "main": "./dist/index.js",
@@ -50,9 +54,10 @@
     "start": "tsx examples/demo.ts",
     "dev": "tsx examples/demo.ts",
     "demo": "tsx examples/demo.ts",
-    "test": "tsx --test src/protocol.test.ts",
+    "test": "tsx --test src/protocol.test.ts src/auth/auth.test.ts",
     "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build",
-    "demo:express": "tsx examples/express.ts"
+    "demo:express": "tsx examples/express.ts",
+    "demo:auth": "tsx examples/auth.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",

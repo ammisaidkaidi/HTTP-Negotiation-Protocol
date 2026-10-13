@@ -30,6 +30,69 @@ DATABASE_URL="postgres://user:password@localhost:5432/mydb" npm start
 
 For external callbacks from another machine, set `PUBLIC_BASE_URL` to a publicly reachable HTTPS URL and secure the application or reverse proxy. The generated callback URL contains an unguessable token, but this is not a substitute for your provider's signature verification where available.
 
+## Authentication (`src/auth/`, v1.9.0)
+
+A challenge-response auth manager for client and server, separate from the
+negotiation flow. One auth process:
+
+```
+clientAuth <--> authManager (server)
+  1. client  -> begin
+  2. client <-> time sync: many fast requests; at the end the client and
+                server clocks must be identical within 50 ms (default),
+                otherwise the connection is closed (CLOCK_SKEW)
+  3. server  -> requests the uid
+  4. client  -> sends uid (server resolves pwd via its lookup function)
+  5. server  -> challenge, encrypted as encryption({data, challenge},
+                pwd + time\50): AES-256-GCM with key HKDF-SHA256(password,
+                bucket = floor(now/50)). `challenge` is a list of function
+                names from the built-in registry of pure functions
+                f(x) => y (add1, double, square, xor42, ... in
+                src/auth/common.ts)
+  6. client  -> resolves the challenge and sends the result back,
+                encrypted the same way
+  7. server  -> validates the result; on success it FIRST saves the token
+                to its registry (that save is what marks the auth as
+                successful), THEN sends the token to the client
+  8. client  -> sends ack; server marks the registry entry acknowledged
+                and closes the handshake. When the connection/process
+                closes, the client runs a fresh auth process next time.
+```
+
+```ts
+import { ClientAuthManager, ServerAuthManager } from "http-negotiation-protocol/auth";
+
+const authServer = new ServerAuthManager({
+  getPassword: async (uid) => users[uid],   // per-user password lookup
+});
+await authServer.listen(4000);
+
+const clientAuth = new ClientAuthManager({
+  authUrl: "http://127.0.0.1:4000/auth",
+  uid: "user1",
+  password: "correct-horse",
+});
+const session = await clientAuth.authenticate();  // { token, uid, expiresAt }
+authServer.validateToken(session.token);          // registry lookup -> entry?
+clientAuth.close();                               // forget token; re-auth next time
+```
+
+Notes:
+
+- Run it over **HTTPS** in production. Passwords are password-equivalents
+  (whoever holds one can answer challenges), so source them from a secret
+  manager / DB rather than hard-coding them.
+- The core is transport-agnostic: `authServer.handleAuthMessage(body)` is
+  the whole state machine; `requestHandler()` / `attach(http)` give it
+  Express/plain-HTTP hosting just like `NegotiationServer`.
+- The 50 ms budget is strict by design: it assumes fast local/edge links
+  and NTP-synced hosts. Both knobs (`maxClockSkewMs`, `timeBucketMs`,
+  `timeSamples`) are options on both managers.
+- Runnable demo: `npm run demo:auth` (`examples/auth.ts`). The library does
+  not yet gate `NegotiationClient.call()` on a token — enforce
+  `authServer.validateToken(token)` in your own routes/middleware if you
+  want that today.
+
 ## Running on Express / other frameworks (v1.7.0)
 
 `NegotiationServer` does not have to own its HTTP server. `requestHandler()`
