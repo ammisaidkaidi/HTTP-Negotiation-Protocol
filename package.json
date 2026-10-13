@@ -1,0 +1,24 @@
+{
+  "name": "http-negotiation-protocol",
+  "version": "1.1.0",
+  "private": true,
+  "description": "A minimal TypeScript HTTP request-negotiation protocol with client services and external callbacks.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/demo.js",
+    "dev": "tsx src/demo.ts",
+    "test": "npm run build && node --test dist/protocol.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  },
+  "optionalDependencies": {
+    "pg": "^8.16.0"
+  }
+}
