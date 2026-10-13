@@ -60,22 +60,31 @@ clientAuth <--> authManager (server)
 ```
 
 ```ts
+import { NegotiationClient, NegotiationServer } from "http-negotiation-protocol";
 import { ClientAuthManager, ServerAuthManager } from "http-negotiation-protocol/auth";
 
-const authServer = new ServerAuthManager({
+// Bind the managers to your negotiation server/client (first argument):
+const negotiationServer = new NegotiationServer();
+const authServer = new ServerAuthManager(negotiationServer, {
   getPassword: async (uid) => users[uid],   // per-user password lookup
 });
-await authServer.listen(4000);
+await authServer.listen(4000);  // /auth -> auth flow, everything else -> negotiationServer
 
-const clientAuth = new ClientAuthManager({
+const negotiationClient = new NegotiationClient();
+const clientAuth = new ClientAuthManager(negotiationClient, {
   authUrl: "http://127.0.0.1:4000/auth",
   uid: "user1",
   password: "correct-horse",
 });
 const session = await clientAuth.authenticate();  // { token, uid, expiresAt }
+// negotiationClient now sends `authorization: Bearer <token>` automatically:
+await negotiationClient.call({ url: "http://127.0.0.1:4000/example", data: {} });
 authServer.validateToken(session.token);          // registry lookup -> entry?
-clientAuth.close();                               // forget token; re-auth next time
+clientAuth.close();                               // forget token; header no longer sent
 ```
+
+The managers also still work standalone (omit the first argument) with
+their own `listen()`/`authUrl`, as in previous versions.
 
 Notes:
 

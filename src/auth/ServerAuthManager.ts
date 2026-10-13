@@ -5,6 +5,7 @@ import {
   type Server as HttpServer,
   type ServerResponse,
 } from "node:http";
+import { NegotiationServer } from "../server.js";
 import {
   applyChallenge,
   AuthError,
@@ -38,6 +39,15 @@ export interface ServerAuthManagerOptions {
   /** Token lifetime in the registry. Default 900_000 (15 min). */
   tokenTtlMs?: number;
   maxBodyBytes?: number;
+  /** Path of the auth endpoint when combined with a NegotiationServer. Default "/auth". */
+  authPath?: string;
+  /**
+   * NegotiationServer to bind to (alternative to passing it as the first
+   * constructor argument): auth requests go to `authPath`, all other
+   * requests are delegated to that server, both share one HTTP server
+   * (see listen()/attach()), and close() shuts both down.
+   */
+  server?: NegotiationServer;
   /** Clock override (testing). */
   now?: () => number;
   onError?: (error: Error, info: { authId?: string; phase: string }) => void;
@@ -113,6 +123,9 @@ function median(values: number[]): number {
 export class ServerAuthManager {
   /** Registry of authenticated sessions, keyed by token. */
   readonly registry = new Map<string, AuthRegistryEntry>();
+  /** The bound NegotiationServer, when one was supplied. */
+  readonly negotiationServer: NegotiationServer | undefined;
+  private readonly authPath: string;
   private readonly pending = new Map<string, PendingAuth>();
   private readonly getPassword: PasswordLookup;
   private readonly maxClockSkewMs: number;
@@ -126,7 +139,20 @@ export class ServerAuthManager {
   private readonly onError: ServerAuthManagerOptions["onError"];
   private httpServerInstance: HttpServer | undefined;
 
-  constructor(options: ServerAuthManagerOptions) {
+  constructor(server: NegotiationServer, options: ServerAuthManagerOptions);
+  constructor(options: ServerAuthManagerOptions);
+  constructor(
+    serverOrOptions: NegotiationServer | ServerAuthManagerOptions,
+    maybeOptions?: ServerAuthManagerOptions,
+  ) {
+    const negotiationServer = serverOrOptions instanceof NegotiationServer
+      ? serverOrOptions
+      : serverOrOptions?.server;
+    const options = (serverOrOptions instanceof NegotiationServer
+      ? maybeOptions
+      : serverOrOptions) as ServerAuthManagerOptions;
+    this.negotiationServer = negotiationServer;
+    this.authPath = options.authPath ?? "/auth";
     if (typeof options?.getPassword !== "function") {
       throw new TypeError("ServerAuthManager requires a getPassword(uid) lookup");
     }
@@ -171,6 +197,9 @@ export class ServerAuthManager {
     if (this.httpServerInstance) throw new Error("Auth server is already listening");
     const httpServer = createHttpServer(this.requestHandler());
     this.attach(httpServer);
+    // Combined hosting: the NegotiationServer tracks the same HTTP server,
+    // so its httpServer/close/error wiring is initialised too.
+    this.negotiationServer?.attach(httpServer);
     await new Promise<void>((resolve, reject) => {
       httpServer.once("error", reject);
       httpServer.listen(port, host, () => {
@@ -182,6 +211,10 @@ export class ServerAuthManager {
 
   async close(): Promise<void> {
     this.pending.clear();
+    // Combined hosting: shut the bound NegotiationServer down too (this
+    // also closes the shared HTTP server and its store; it is idempotent,
+    // so the HTTP close below becomes a no-op in that case).
+    if (this.negotiationServer) await this.negotiationServer.close();
     const httpServer = this.httpServerInstance;
     this.httpServerInstance = undefined;
     if (httpServer?.listening) {
@@ -192,8 +225,22 @@ export class ServerAuthManager {
     }
   }
 
+  /**
+   * HTTP handler. When a NegotiationServer is bound, requests to `authPath`
+   * (default "/auth") run the auth flow and every other request is
+   * delegated to that NegotiationServer, so one HTTP server serves both.
+   * Standalone, every POST runs the auth flow (as before).
+   */
   requestHandler(): (req: IncomingMessage, res: ServerResponse) => void {
     return (req, res) => {
+      const negotiationServer = this.negotiationServer;
+      if (negotiationServer) {
+        const path = new URL(req.url ?? "/", "http://localhost").pathname;
+        if (path !== this.authPath) {
+          void negotiationServer.handleRequest(req, res);
+          return;
+        }
+      }
       void this.handleRequest(req, res);
     };
   }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:net";
 import test from "node:test";
+import { NegotiationClient, NegotiationServer } from "../protocol.js";
 import {
   ClientAuthManager,
   ServerAuthManager,
@@ -120,4 +121,60 @@ test("challenge functions are deterministic and the handshake rejects tampered a
   });
   assert.equal(answer.status, 403);
   assert.equal(server.registry.size, 0);
+});
+
+test("managers bound to NegotiationClient/NegotiationServer share one HTTP server and carry the token", async () => {
+  // Server side: one NegotiationServer + ServerAuthManager bound to it.
+  const negotiationServer = new NegotiationServer({ requestTimeoutMs: 5_000 });
+  negotiationServer.handle("/whoami", async (request) => {
+    const header = request.headers.authorization;
+    const token = typeof header === "string" && header.startsWith("Bearer ") ? header.slice(7) : "";
+    const entry = authServer.validateToken(token);
+    return { authenticated: entry !== undefined, uid: entry?.uid ?? null };
+  });
+  const authServer = new ServerAuthManager(negotiationServer, {
+    getPassword: (uid) => passwords[uid],
+  });
+  assert.equal(authServer.negotiationServer, negotiationServer);
+
+  // Client side: one NegotiationClient + ClientAuthManager bound to it.
+  const negotiationClient = new NegotiationClient();
+  const port = await findFreePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const clientAuth = new ClientAuthManager(negotiationClient, {
+    authUrl: `${baseUrl}/auth`,
+    uid: "user1",
+    password: "correct-horse",
+  });
+  assert.equal(clientAuth.negotiationClient, negotiationClient);
+
+  // One HTTP server (auth server's listen) serves /auth AND negotiation.
+  await authServer.listen(port, "127.0.0.1");
+  try {
+    assert.equal(negotiationServer.httpServer !== undefined, true);
+    assert.equal(authServer.httpServer, negotiationServer.httpServer);
+
+    // Before auth: no token header is sent.
+    assert.deepEqual(
+      await negotiationClient.call({ url: `${baseUrl}/whoami`, data: {} }),
+      { authenticated: false, uid: null },
+    );
+
+    // After auth: the bound NegotiationClient sends the token automatically.
+    await clientAuth.authenticate();
+    assert.deepEqual(
+      await negotiationClient.call({ url: `${baseUrl}/whoami`, data: {} }),
+      { authenticated: true, uid: "user1" },
+    );
+
+    // After close(): the header is gone again without touching the client setup.
+    clientAuth.close();
+    assert.deepEqual(
+      await negotiationClient.call({ url: `${baseUrl}/whoami`, data: {} }),
+      { authenticated: false, uid: null },
+    );
+  } finally {
+    await authServer.close(); // also closes the NegotiationServer + HTTP server
+  }
+  assert.equal(negotiationServer.httpServer, undefined);
 });

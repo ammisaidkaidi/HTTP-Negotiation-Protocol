@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] - 2026-10-13
+
+### Changed
+
+- Renamed `src/auth/client.ts` -> `src/auth/ClientAuthManager.ts` and
+  `src/auth/server.ts` -> `src/auth/ServerAuthManager.ts`.
+
+### Added
+
+- `ClientAuthManager` now accepts a `NegotiationClient` as its first
+  constructor argument (or via the `client` option) and uses it: after
+  `authenticate()` that client automatically sends
+  `authorization: Bearer <token>` and `x-auth-uid` on every negotiation
+  call, and stops after `close()`.
+- `ServerAuthManager` now accepts a `NegotiationServer` as its first
+  constructor argument (or via the `server` option) and uses it: its HTTP
+  handler serves the auth flow on `authPath` (default `/auth`) and
+  delegates all other requests to the NegotiationServer, both share one
+  HTTP server via `listen()`/`attach()` wiring, and `close()` shuts both
+  down. Standalone (old) constructor forms keep working unchanged.
+
 ## [1.9.0] - 2026-10-13
 
 ### Added

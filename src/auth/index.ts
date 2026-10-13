@@ -16,11 +16,11 @@ export type {
   ChallengeAnswerPayload,
   ChallengePayload,
 } from "./common.js";
-export { ClientAuth, ClientAuthManager } from "./client.js";
-export type { ClientAuthManagerOptions } from "./client.js";
-export { AuthManager, ServerAuthManager } from "./server.js";
+export { ClientAuth, ClientAuthManager } from "./ClientAuthManager.js";
+export type { ClientAuthManagerOptions } from "./ClientAuthManager.js";
+export { AuthManager, ServerAuthManager } from "./ServerAuthManager.js";
 export type {
   AuthWireResult,
   PasswordLookup,
   ServerAuthManagerOptions,
-} from "./server.js";
+} from "./ServerAuthManager.js";

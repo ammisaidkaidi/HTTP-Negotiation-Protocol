@@ -1,3 +1,5 @@
+import { NegotiationClient } from "../client.js";
+import type { ClientPlugin } from "../common.js";
 import {
   applyChallenge,
   AuthError,
@@ -24,6 +26,13 @@ export interface ClientAuthManagerOptions {
   /** Clock override (testing). */
   now?: () => number;
   fetchImpl?: typeof fetch;
+  /**
+   * NegotiationClient to bind to (alternative to passing it as the first
+   * constructor argument). After a successful authenticate(), this client
+   * automatically sends `authorization: Bearer <token>` (and `x-auth-uid`)
+   * on every negotiation call; after close() it stops sending them.
+   */
+  client?: NegotiationClient;
 }
 
 interface TimeSample {
@@ -44,6 +53,8 @@ interface TimeSample {
  *   `close()` is called; after that a fresh auth process is required.
  */
 export class ClientAuthManager {
+  /** The bound NegotiationClient, when one was supplied. */
+  readonly negotiationClient: NegotiationClient | undefined;
   private readonly authUrl: string;
   private readonly uid: string;
   private readonly password: string;
@@ -57,7 +68,19 @@ export class ClientAuthManager {
   /** Clock offset estimated by the last successful time sync (server - client). */
   lastClockOffsetMs: number | undefined;
 
-  constructor(options: ClientAuthManagerOptions) {
+  constructor(client: NegotiationClient, options: ClientAuthManagerOptions);
+  constructor(options: ClientAuthManagerOptions);
+  constructor(
+    clientOrOptions: NegotiationClient | ClientAuthManagerOptions,
+    maybeOptions?: ClientAuthManagerOptions,
+  ) {
+    const client = clientOrOptions instanceof NegotiationClient
+      ? clientOrOptions
+      : clientOrOptions?.client;
+    const options = (clientOrOptions instanceof NegotiationClient
+      ? maybeOptions
+      : clientOrOptions) as ClientAuthManagerOptions;
+    this.negotiationClient = client;
     if (!options?.authUrl) throw new TypeError("ClientAuthManager requires authUrl");
     if (!options.uid) throw new TypeError("ClientAuthManager requires uid");
     if (!options.password) throw new TypeError("ClientAuthManager requires password");
@@ -70,6 +93,31 @@ export class ClientAuthManager {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
     this.now = options.now ?? Date.now;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    if (client) this.bindToNegotiationClient(client);
+  }
+
+  /**
+   * Bind to a NegotiationClient: installs a plugin that injects the current
+   * auth token into every negotiation request made through that client.
+   * The plugin reads the token live, so re-authentication and close() take
+   * effect without re-registering anything.
+   */
+  private bindToNegotiationClient(client: NegotiationClient): void {
+    const plugin: ClientPlugin = {
+      onRequest: (request) => {
+        const token = this.token;
+        if (!token) return; // unauthenticated: leave headers untouched
+        return {
+          ...request,
+          headers: {
+            ...request.headers,
+            authorization: `Bearer ${token}`,
+            "x-auth-uid": this.uid,
+          },
+        };
+      },
+    };
+    client.use(plugin);
   }
 
   /** Current in-memory token, if authenticated and not expired. */
