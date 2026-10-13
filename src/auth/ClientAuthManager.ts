@@ -1,4 +1,4 @@
-import { NegotiationClient } from "../client.js";
+import { NegotiationClient } from "../NegotiationClient.js";
 import type { ClientPlugin } from "../common.js";
 import {
   applyChallenge,

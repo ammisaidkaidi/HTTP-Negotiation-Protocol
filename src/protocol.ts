@@ -1,6 +1,6 @@
 /**
  * Backwards-compatible barrel: the library was split into common.ts,
- * client.ts, and server.ts for maintainability, but every public
+ * NegotiationClient.ts, and NegotiationServer.ts for maintainability, but every public
  * name remains importable from "./protocol.js" exactly as before.
  */
 export { act, defineAction, defineContract, defineService, svc } from "./common.js";
@@ -41,7 +41,7 @@ export {
   Server,
   ServerActionInvocation,
   createServer,
-} from "./server.js";
-export type { NegotiationServerOptions } from "./server.js";
-export { Client, NegotiationClient, createClient } from "./client.js";
-export type { NegotiationClientOptions } from "./client.js";
+} from "./NegotiationServer.js";
+export type { NegotiationServerOptions } from "./NegotiationServer.js";
+export { Client, NegotiationClient, createClient } from "./NegotiationClient.js";
+export type { NegotiationClientOptions } from "./NegotiationClient.js";

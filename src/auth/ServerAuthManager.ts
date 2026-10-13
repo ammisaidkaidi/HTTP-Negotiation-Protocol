@@ -5,7 +5,7 @@ import {
   type Server as HttpServer,
   type ServerResponse,
 } from "node:http";
-import { NegotiationServer } from "../server.js";
+import { NegotiationServer } from "../NegotiationServer.js";
 import {
   applyChallenge,
   AuthError,
