@@ -1,0 +1,1032 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
+import {
+  createServer as createHttpServer,
+  type IncomingMessage,
+  type Server as HttpServer,
+  type ServerResponse,
+} from "node:http";
+import { URL } from "node:url";
+
+export type JsonRecord = Record<string, unknown>;
+
+export interface ClientCallRequest {
+  url: string;
+  params?: Record<string, string | number | boolean | null | undefined>;
+  data?: unknown;
+  headers?: Record<string, string>;
+}
+
+export interface ServerRequest {
+  jobId: string;
+  method: string;
+  path: string;
+  origin: string;
+  params: Record<string, unknown>;
+  data: unknown;
+  headers: Record<string, string | string[] | undefined>;
+}
+
+export interface ClientAction {
+  name: string;
+  data: unknown;
+  callbackID: string;
+}
+
+/** Public action descriptor; callback IDs are generated inside Server.require(). */
+export interface ClientServiceRequest {
+  name: string;
+  data?: unknown;
+  /** Value to use if this optional client service fails. */
+  fallback?: unknown;
+}
+
+export type ActionResult =
+  | { callbackID: string; ok: true; result: unknown }
+  | {
+      callbackID: string;
+      ok: false;
+      error: { code: string; message: string };
+    };
+
+export interface NegotiationResponse {
+  protocol: 1;
+  jobId: string;
+  round: number;
+  done: boolean;
+  result?: unknown;
+  error?: { code: string; message: string };
+  actions: ClientAction[];
+  resumeUrl?: string;
+  resumeToken?: string;
+}
+
+export interface HttpPluginRequest {
+  url: string;
+  method: "POST";
+  headers: Record<string, string>;
+  body: unknown;
+  phase: "initial" | "resume";
+}
+
+export interface HttpPluginResponse {
+  url: string;
+  status: number;
+  headers: Record<string, string>;
+  phase: "initial" | "resume";
+}
+
+export interface ClientPlugin {
+  onRequest?: (
+    request: HttpPluginRequest,
+  ) => void | HttpPluginRequest | Promise<void | HttpPluginRequest>;
+  onResponse?: (
+    body: unknown,
+    response: HttpPluginResponse,
+  ) => void | unknown | Promise<void | unknown>;
+  onError?: (error: Error, request: HttpPluginRequest) => void | Promise<void>;
+}
+
+export type ClientService = (data: any) => unknown | Promise<unknown>;
+export type ClientServices = Record<string, ClientService>;
+export type ServerAction = (data: any, request?: ServerRequest) => unknown | Promise<unknown>;
+export type RouteHandler = (request: ServerRequest) => unknown | Promise<unknown>;
+
+export interface StoredRequestResponse {
+  jobId: string;
+  request: ServerRequest;
+  response: NegotiationResponse;
+  createdAt: string;
+}
+
+export interface RequestStore {
+  save(entry: StoredRequestResponse): Promise<void>;
+  close?(): Promise<void>;
+}
+
+export class MemoryRequestStore implements RequestStore {
+  readonly records = new Map<string, StoredRequestResponse>();
+
+  async save(entry: StoredRequestResponse): Promise<void> {
+    this.records.set(entry.jobId, structuredClone(entry));
+  }
+}
+
+interface PgPoolLike {
+  query(sql: string, values?: unknown[]): Promise<unknown>;
+  end(): Promise<void>;
+}
+
+/** Persists final request/response pairs to PostgreSQL. Requires the optional `pg` package. */
+export class PostgresRequestStore implements RequestStore {
+  private readonly poolPromise: Promise<PgPoolLike>;
+  private initialized = false;
+
+  constructor(connectionString?: string) {
+    // Use a variable import so PostgreSQL types are not required by consumers
+    // that only use the default in-memory store.
+    const packageName = "pg";
+    this.poolPromise = import(packageName).then(({ Pool }) => new Pool(connectionString ? { connectionString } : {}) as PgPoolLike);
+  }
+
+  private async init(): Promise<void> {
+    if (this.initialized) return;
+    const pool = await this.poolPromise;
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS negotiation_logs (
+        job_id TEXT PRIMARY KEY,
+        request JSONB NOT NULL,
+        response JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    this.initialized = true;
+  }
+
+  async save(entry: StoredRequestResponse): Promise<void> {
+    await this.init();
+    const pool = await this.poolPromise;
+    await pool.query(
+      `INSERT INTO negotiation_logs (job_id, request, response, created_at)
+       VALUES ($1, $2::jsonb, $3::jsonb, $4::timestamptz)
+       ON CONFLICT (job_id) DO UPDATE SET
+         request = EXCLUDED.request,
+         response = EXCLUDED.response,
+         created_at = EXCLUDED.created_at`,
+      [
+        entry.jobId,
+        JSON.stringify(entry.request),
+        JSON.stringify(entry.response),
+        entry.createdAt,
+      ],
+    );
+  }
+
+  async close(): Promise<void> {
+    await (await this.poolPromise).end();
+  }
+}
+
+export interface NegotiationServerOptions {
+  publicBaseUrl?: string;
+  callbackPath?: string;
+  store?: RequestStore;
+  maxBodyBytes?: number;
+  requestTimeoutMs?: number;
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function toError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
+function errorPayload(value: unknown): { code: string; message: string } {
+  const error = toError(value);
+  const maybeCode = (value as { code?: unknown } | null)?.code;
+  return {
+    code: typeof maybeCode === "string" ? maybeCode : "INTERNAL_ERROR",
+    message: error.message || "An unexpected error occurred",
+  };
+}
+
+function headerRecord(headers: IncomingMessage["headers"]): ServerRequest["headers"] {
+  return { ...headers };
+}
+
+function responseHeaders(res: Response): Record<string, string> {
+  const output: Record<string, string> = {};
+  res.headers.forEach((value, key) => (output[key] = value));
+  return output;
+}
+
+async function readJson(req: IncomingMessage, maxBytes: number): Promise<any> {
+  const chunks: Buffer[] = [];
+  let length = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    length += buffer.length;
+    if (length > maxBytes) {
+      const error = new Error(`Request body exceeds ${maxBytes} bytes`);
+      (error as Error & { code: string }).code = "BODY_TOO_LARGE";
+      throw error;
+    }
+    chunks.push(buffer);
+  }
+  if (length === 0) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    const error = new Error("Request body must be valid JSON");
+    (error as Error & { code: string }).code = "INVALID_JSON";
+    throw error;
+  }
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  if (res.writableEnded || res.destroyed) return;
+  const encoded = JSON.stringify(body);
+  res.statusCode = status;
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.setHeader("content-length", Buffer.byteLength(encoded));
+  res.end(encoded);
+}
+
+function waitForResponseEnd(res: ServerResponse): Promise<void> {
+  if (res.writableEnded || res.destroyed) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      res.off("finish", done);
+      res.off("close", done);
+      resolve();
+    };
+    res.once("finish", done);
+    res.once("close", done);
+  });
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function unwrapActionResult(item: ActionResult): unknown {
+  if (item.ok) return item.result;
+  const error = new Error(item.error.message) as Error & { code: string };
+  error.code = item.error.code;
+  throw error;
+}
+
+interface PendingRound {
+  round: number;
+  expected: Set<string>;
+  resolve(results: ActionResult[]): void;
+  reject(error: unknown): void;
+}
+
+interface ExternalCallback {
+  token: string;
+  result: Deferred<unknown>;
+  settled: boolean;
+}
+
+interface JobContext {
+  jobId: string;
+  resumeToken: string;
+  request: ServerRequest;
+  currentResponse: ServerResponse | null;
+  round: number;
+  result: unknown;
+  resultSet: boolean;
+  ended: boolean;
+  pending: PendingRound | undefined;
+  latestOutgoing?: NegotiationResponse;
+  externalCallbacks: Map<string, ExternalCallback>;
+  receivedExternalCallbacks: Set<string>;
+  startedAt: string;
+}
+
+const ACTION_INVOCATION = Symbol("server-action-invocation");
+
+/** A lazy server action: await it for direct execution, or pass it to createCallback. */
+export class ServerActionInvocation<T = unknown> implements PromiseLike<T> {
+  readonly [ACTION_INVOCATION] = true;
+
+  constructor(
+    readonly name: string,
+    readonly data: unknown,
+    private readonly run: (data: unknown) => Promise<T>,
+  ) {}
+
+  execute(dataOverride?: unknown): Promise<T> {
+    return this.run(dataOverride === undefined ? this.data : dataOverride);
+  }
+
+  then<TResult1 = T, TResult2 = never>(
+    onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.execute().then(onfulfilled ?? undefined, onrejected ?? undefined);
+  }
+}
+
+export class NegotiationServer {
+  private readonly storage = new AsyncLocalStorage<JobContext>();
+  private readonly routes = new Map<string, RouteHandler>();
+  private readonly actions = new Map<string, ServerAction>();
+  private readonly jobs = new Map<string, JobContext>();
+  private readonly callbackPaths = new Set<string>();
+  private readonly store: RequestStore;
+  private httpServer: HttpServer | undefined;
+  private readonly publicBaseUrl: string | undefined;
+  private readonly defaultCallbackPath: string;
+  private readonly maxBodyBytes: number;
+  private readonly requestTimeoutMs: number;
+
+  constructor(options: NegotiationServerOptions = {}) {
+    this.store = options.store ?? new MemoryRequestStore();
+    this.publicBaseUrl = options.publicBaseUrl;
+    this.defaultCallbackPath = options.callbackPath ?? "/__negotiation/callback";
+    this.callbackPaths.add(new URL(this.defaultCallbackPath, "http://localhost").pathname);
+    this.maxBodyBytes = options.maxBodyBytes ?? 1_000_000;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 120_000;
+  }
+
+  /** Register an HTTP route that participates in negotiation. */
+  handle(path: string, handler: RouteHandler): this {
+    this.routes.set(new URL(path, "http://localhost").pathname, handler);
+    return this;
+  }
+
+  /** Register server-side actions that can be invoked with Server.call(). */
+  use(actions: Record<string, ServerAction>): this {
+    for (const [name, action] of Object.entries(actions)) {
+      if (!name.trim() || typeof action !== "function") {
+        throw new TypeError("Server.use expects a map of action names to functions");
+      }
+      this.actions.set(name, action);
+    }
+    return this;
+  }
+
+  async listen(port = 3000, host = "127.0.0.1"): Promise<void> {
+    if (this.httpServer) throw new Error("Server is already listening");
+    this.httpServer = createHttpServer((req, res) => {
+      void this.dispatch(req, res).catch((error: unknown) => {
+        sendJson(res, 500, { ok: false, error: errorPayload(error) });
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      this.httpServer!.once("error", reject);
+      this.httpServer!.listen(port, host, () => {
+        this.httpServer!.off("error", reject);
+        resolve();
+      });
+    });
+  }
+
+  async close(): Promise<void> {
+    if (this.httpServer) {
+      await new Promise<void>((resolve, reject) => {
+        this.httpServer!.close((error) => (error ? reject(error) : resolve()));
+      });
+      this.httpServer = undefined;
+    }
+    await this.store.close?.();
+  }
+
+  /** Stores the result; the actual HTTP response is sent by end(). */
+  respond(request: ServerRequest, result: unknown): void {
+    const context = this.requireContext(request);
+    context.result = result;
+    context.resultSet = true;
+  }
+
+  /**
+   * Ask the client to execute one registered service and return its value.
+   * Service errors become ordinary thrown Errors, so callers can use try/catch.
+   */
+  async require<T = unknown>(name: string, data?: unknown): Promise<T>;
+  /** Ask the client to execute several registered services in one HTTP round. */
+  async require<T = unknown>(actions: ClientServiceRequest[]): Promise<T[]>;
+  /** Low-level compatibility overload for callers that need per-action status objects. */
+  async require(input: { actions: ClientAction[] }): Promise<ActionResult[]>;
+  async require<T = unknown>(
+    input: string | ClientServiceRequest[] | { actions: ClientAction[] },
+    data?: unknown,
+  ): Promise<T | T[] | ActionResult[]> {
+    if (typeof input === "string") {
+      const [result] = await this.requestClientActions([
+        { name: input, data, callbackID: `cb_${randomUUID()}` },
+      ]);
+      return unwrapActionResult(result) as T;
+    }
+    if (Array.isArray(input)) {
+      if (input.length === 0) return [] as T[];
+      const actions = input.map((action) => ({
+        name: action.name,
+        data: action.data ?? null,
+        callbackID: `cb_${randomUUID()}`,
+      }));
+      const results = await this.requestClientActions(actions);
+      return results.map((result, index) => {
+        if (result.ok) return result.result;
+        const descriptor = input[index];
+        if (descriptor && Object.prototype.hasOwnProperty.call(descriptor, "fallback")) {
+          return descriptor.fallback;
+        }
+        return unwrapActionResult(result);
+      }) as T[];
+    }
+    return this.requestClientActions(input.actions);
+  }
+
+  /** Explicitly named alternative when a batch of client services is required. */
+  async requireMany<T = unknown>(actions: ClientServiceRequest[]): Promise<T[]> {
+    return await this.require<T>(actions);
+  }
+
+  private async requestClientActions(inputActions: ClientAction[]): Promise<ActionResult[]> {
+    const context = this.requireContext();
+    if (context.ended) throw new Error("Cannot negotiate after Server.end()");
+    if (context.pending) throw new Error("This job already has a pending negotiation round");
+    if (!Array.isArray(inputActions) || inputActions.length === 0) {
+      throw new TypeError("Server.require expects at least one action");
+    }
+
+    const ids = inputActions.map((action) => action.callbackID);
+    if (ids.some((id) => !id) || new Set(ids).size !== ids.length) {
+      throw new Error("Every action must have a unique, non-empty callbackID");
+    }
+
+    const round = context.round + 1;
+    context.round = round;
+    const wait = deferred<ActionResult[]>();
+    context.pending = {
+      round,
+      expected: new Set(ids),
+      resolve: wait.resolve,
+      reject: wait.reject,
+    };
+
+    const response: NegotiationResponse = {
+      protocol: 1,
+      jobId: context.jobId,
+      round,
+      done: false,
+      result: null,
+      actions: inputActions,
+      resumeUrl: "/__negotiation/resume",
+      resumeToken: context.resumeToken,
+    };
+    this.sendProtocolResponse(context, response);
+
+    const timeout = setTimeout(() => {
+      if (context.pending?.round === round) {
+        context.pending = undefined;
+        wait.reject(new Error(`Negotiation round ${round} timed out`));
+      }
+    }, this.requestTimeoutMs);
+    try {
+      return await wait.promise;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Execute a registered server-side action. Await the result directly.
+   * For external webhooks, use callback() to hide callback IDs and tokens.
+   */
+  call<T = unknown>(name: string, data: unknown): ServerActionInvocation<T> {
+    return new ServerActionInvocation<T>(name, data, async (input) => {
+      const action = this.actions.get(name);
+      if (!action) throw new Error(`Unknown server action: ${name}`);
+      const context = this.storage.getStore();
+      return (await action(input, context?.request)) as T;
+    });
+  }
+
+  /**
+   * Run a server action that arranges an external callback, then wait for that callback.
+   * The action receives an automatically generated callbackUrl. The caller never
+   * needs to create or track jobId/callbackID/token values.
+   */
+  async callback<T = unknown>(
+    actionName: string,
+    data: unknown,
+    callbackPathOrUrl?: string,
+  ): Promise<T> {
+    const context = this.requireContext();
+    return this.createCallback<T>(context.request, this.call(actionName, data), callbackPathOrUrl);
+  }
+
+  /**
+   * Starts a server-side action and waits for an external callback to arrive.
+   * callbackOrUrl can be a callback function or a callback endpoint URL/path.
+   * The action receives { ...data, jobId, callbackID, callbackUrl }.
+   */
+  createCallback<T = unknown>(
+    request: ServerRequest,
+    actionCall: ServerActionInvocation<unknown>,
+    callbackOrUrl?: ((payload: T) => unknown | Promise<unknown>) | string,
+  ): Promise<T> {
+    const context = this.requireContext(request);
+    if (!(actionCall instanceof ServerActionInvocation) || !actionCall[ACTION_INVOCATION]) {
+      throw new TypeError("Server.createCallback expects Server.call(action, data) as its second argument");
+    }
+
+    const callbackID = `cb_${randomUUID()}`;
+    const token = randomUUID();
+    const callbackBase = typeof callbackOrUrl === "string" ? callbackOrUrl : this.defaultCallbackPath;
+    const base = this.publicBaseUrl ?? context.request.origin;
+    const callbackURL = new URL(callbackBase, base);
+    this.callbackPaths.add(callbackURL.pathname);
+    callbackURL.searchParams.set("jobId", context.jobId);
+    callbackURL.searchParams.set("callbackID", callbackID);
+    callbackURL.searchParams.set("token", token);
+
+    const wait = deferred<T>();
+    context.externalCallbacks.set(callbackID, {
+      token,
+      result: wait as Deferred<unknown>,
+      settled: false,
+    });
+
+    const originalData = actionCall.data;
+    const injectedData: Record<string, unknown> = isObjectRecord(originalData)
+      ? { ...originalData, jobId: context.jobId, callbackID, callbackUrl: callbackURL.toString() }
+      : { value: originalData, jobId: context.jobId, callbackID, callbackUrl: callbackURL.toString() };
+
+    // Register the callback before starting the action so an immediate webhook cannot race registration.
+    void actionCall.execute(injectedData).catch((error: unknown) => {
+      const entry = context.externalCallbacks.get(callbackID);
+      if (entry && !entry.settled) {
+        entry.settled = true;
+        entry.result.reject(error);
+      }
+    });
+
+    const callbackTimer = setTimeout(() => {
+      const entry = context.externalCallbacks.get(callbackID);
+      if (entry && !entry.settled) {
+        entry.settled = true;
+        entry.result.reject(new Error(`External callback ${callbackID} timed out`));
+      }
+    }, this.requestTimeoutMs);
+
+    return wait.promise.then(async (payload) => {
+      if (typeof callbackOrUrl === "function") await callbackOrUrl(payload);
+      return payload;
+    }).finally(() => clearTimeout(callbackTimer));
+  }
+
+  /** Finish this job, optionally set the final result, persist it, and answer the current HTTP turn. */
+  async end(result?: unknown): Promise<void> {
+    const context = this.requireContext();
+    if (context.ended) return;
+    if (arguments.length > 0) {
+      context.result = result;
+      context.resultSet = true;
+    }
+
+    const response: NegotiationResponse = {
+      protocol: 1,
+      jobId: context.jobId,
+      round: context.round,
+      done: true,
+      result: context.resultSet ? context.result : null,
+      actions: [],
+    };
+    await this.store.save({
+      jobId: context.jobId,
+      request: context.request,
+      response,
+      createdAt: context.startedAt,
+    });
+    context.ended = true;
+    context.latestOutgoing = response;
+    this.sendJsonToCurrentResponse(context, response);
+    this.cleanupWhenFinished(context);
+  }
+
+  /** Allows read-only diagnostics/testing without exposing the mutable jobs map. */
+  getJobCount(): number {
+    return this.jobs.size;
+  }
+
+  private requireContext(request?: ServerRequest): JobContext {
+    const context = this.storage.getStore();
+    if (!context) throw new Error("This Server method must run inside a Server.handle() job");
+    if (request && request !== context.request) {
+      throw new Error("The supplied request does not belong to the current job");
+    }
+    return context;
+  }
+
+  private sendProtocolResponse(context: JobContext, response: NegotiationResponse): void {
+    context.latestOutgoing = response;
+    this.sendJsonToCurrentResponse(context, response);
+  }
+
+  private sendJsonToCurrentResponse(context: JobContext, payload: unknown): void {
+    const response = context.currentResponse;
+    if (!response || response.writableEnded || response.destroyed) {
+      throw new Error("There is no open HTTP response for this negotiation turn");
+    }
+    sendJson(response, 200, payload);
+  }
+
+  private cleanupWhenFinished(context: JobContext): void {
+    const response = context.currentResponse;
+    if (!response) {
+      this.jobs.delete(context.jobId);
+      return;
+    }
+    const cleanup = () => {
+      response.off("finish", cleanup);
+      response.off("close", cleanup);
+      this.jobs.delete(context.jobId);
+    };
+    if (response.writableEnded || response.destroyed) {
+      this.jobs.delete(context.jobId);
+    } else {
+      response.once("finish", cleanup);
+      response.once("close", cleanup);
+    }
+  }
+
+  private async dispatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const host = req.headers.host ?? "127.0.0.1";
+    const forwardedProto = req.headers["x-forwarded-proto"];
+    const origin = this.publicBaseUrl ?? `${Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto ?? "http"}://${host}`;
+    const url = new URL(req.url ?? "/", origin);
+
+    if (req.method === "POST" && url.pathname === "/__negotiation/resume") {
+      await this.handleResume(req, res);
+      return;
+    }
+    if (req.method === "POST" && this.callbackPaths.has(url.pathname)) {
+      await this.handleExternalCallback(req, res, url);
+      return;
+    }
+
+    if (req.method !== "POST") {
+      sendJson(res, 405, { ok: false, error: { code: "METHOD_NOT_ALLOWED", message: "Use POST" } });
+      return;
+    }
+    const route = this.routes.get(url.pathname);
+    if (!route) {
+      sendJson(res, 404, { ok: false, error: { code: "NOT_FOUND", message: `No route: ${url.pathname}` } });
+      return;
+    }
+
+    let body: any;
+    try {
+      body = await readJson(req, this.maxBodyBytes);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: errorPayload(error) });
+      return;
+    }
+
+    const jobId = randomUUID();
+    const context: JobContext = {
+      jobId,
+      resumeToken: randomUUID(),
+      request: {
+        jobId,
+        method: req.method,
+        path: url.pathname,
+        origin,
+        params: isObjectRecord(body.params) ? body.params : {},
+        data: body.data,
+        headers: headerRecord(req.headers),
+      },
+      currentResponse: res,
+      round: 0,
+      result: null,
+      resultSet: false,
+      ended: false,
+      pending: undefined,
+      externalCallbacks: new Map(),
+      receivedExternalCallbacks: new Set(),
+      startedAt: new Date().toISOString(),
+    };
+    this.jobs.set(jobId, context);
+
+    // The handler remains suspended at Server.require() while separate HTTP requests resume it.
+    await this.storage.run(context, async () => {
+      try {
+        const returned = await route(context.request);
+        if (!context.ended) {
+          if (!context.resultSet && returned !== undefined) {
+            context.result = returned;
+            context.resultSet = true;
+          }
+          await this.end();
+        }
+      } catch (error) {
+        await this.finishWithError(context, error);
+      }
+    });
+  }
+
+  private async handleResume(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let body: any;
+    try {
+      body = await readJson(req, this.maxBodyBytes);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: errorPayload(error) });
+      return;
+    }
+
+    const context = this.jobs.get(String(body.jobId ?? ""));
+    if (!context || context.ended) {
+      sendJson(res, 404, { ok: false, error: { code: "UNKNOWN_JOB", message: "Job not found or already finished" } });
+      return;
+    }
+    if (body.resumeToken !== context.resumeToken) {
+      sendJson(res, 403, { ok: false, error: { code: "INVALID_RESUME_TOKEN", message: "Invalid resume token" } });
+      return;
+    }
+
+    const pending = context.pending;
+    if (!pending || body.round !== pending.round) {
+      sendJson(res, 409, { ok: false, error: { code: "UNEXPECTED_ROUND", message: "No matching negotiation round is pending" } });
+      return;
+    }
+
+    if (!Array.isArray(body.results)) {
+      sendJson(res, 400, { ok: false, error: { code: "INVALID_RESULTS", message: "results must be an array" } });
+      return;
+    }
+    const resultIds = body.results.map((item: any) => item?.callbackID);
+    if (
+      resultIds.some((id: unknown) => typeof id !== "string") ||
+      new Set(resultIds).size !== resultIds.length ||
+      resultIds.length !== pending.expected.size ||
+      resultIds.some((id: string) => !pending.expected.has(id))
+    ) {
+      sendJson(res, 400, { ok: false, error: { code: "INVALID_CALLBACK_IDS", message: "Results must contain every expected callbackID exactly once" } });
+      return;
+    }
+
+    const normalized: ActionResult[] = [];
+    for (const item of body.results) {
+      if (item.ok === true) {
+        normalized.push({ callbackID: item.callbackID, ok: true, result: item.result });
+      } else if (item.ok === false && isObjectRecord(item.error)) {
+        normalized.push({
+          callbackID: item.callbackID,
+          ok: false,
+          error: {
+            code: typeof item.error.code === "string" ? item.error.code : "ACTION_FAILED",
+            message: typeof item.error.message === "string" ? item.error.message : "Action failed",
+          },
+        });
+      } else {
+        sendJson(res, 400, { ok: false, error: { code: "INVALID_ACTION_RESULT", message: "Each result must include ok: true or ok: false" } });
+        return;
+      }
+    }
+
+    const responseFinished = waitForResponseEnd(res);
+    context.currentResponse = res;
+    context.pending = undefined;
+    pending.resolve(normalized);
+    await responseFinished;
+  }
+
+  private async handleExternalCallback(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+  ): Promise<void> {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { ok: false, error: { code: "METHOD_NOT_ALLOWED", message: "Use POST" } });
+      return;
+    }
+    let body: unknown;
+    try {
+      body = await readJson(req, this.maxBodyBytes);
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: errorPayload(error) });
+      return;
+    }
+
+    const jobId = url.searchParams.get("jobId") ?? "";
+    const callbackID = url.searchParams.get("callbackID") ?? "";
+    const token = url.searchParams.get("token") ?? "";
+    const context = this.jobs.get(jobId);
+    const callback = context?.externalCallbacks.get(callbackID);
+    if (!context || !callback || callback.token !== token) {
+      sendJson(res, 403, { ok: false, error: { code: "INVALID_CALLBACK", message: "Unknown callback or invalid token" } });
+      return;
+    }
+    if (callback.settled || context.receivedExternalCallbacks.has(callbackID)) {
+      sendJson(res, 200, { ok: true, duplicate: true });
+      return;
+    }
+
+    callback.settled = true;
+    context.receivedExternalCallbacks.add(callbackID);
+    callback.result.resolve(body);
+    sendJson(res, 200, { ok: true, received: true });
+  }
+
+  private async finishWithError(context: JobContext, error: unknown): Promise<void> {
+    if (context.ended) return;
+    const response: NegotiationResponse = {
+      protocol: 1,
+      jobId: context.jobId,
+      round: context.round,
+      done: true,
+      error: errorPayload(error),
+      actions: [],
+    };
+    try {
+      await this.store.save({
+        jobId: context.jobId,
+        request: context.request,
+        response,
+        createdAt: context.startedAt,
+      });
+    } catch (storeError) {
+      console.error("Failed to save negotiation log:", toError(storeError).message);
+    }
+    context.ended = true;
+    context.latestOutgoing = response;
+    const currentResponse = context.currentResponse;
+    if (currentResponse && !currentResponse.writableEnded && !currentResponse.destroyed) {
+      sendJson(currentResponse, 200, response);
+      this.cleanupWhenFinished(context);
+    } else {
+      this.jobs.delete(context.jobId);
+    }
+  }
+}
+
+export interface NegotiationClientOptions {
+  serviceTimeoutMs?: number;
+  requestTimeoutMs?: number;
+}
+
+export class NegotiationClient {
+  private readonly plugins: ClientPlugin[] = [];
+  private readonly services = new Map<string, ClientService>();
+  private readonly serviceTimeoutMs: number;
+  private readonly requestTimeoutMs: number;
+
+  constructor(options: NegotiationClientOptions = {}) {
+    this.serviceTimeoutMs = options.serviceTimeoutMs ?? 60_000;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 120_000;
+  }
+
+  /** Register one/many HTTP plugins, or a map of named client-side services. */
+  use(pluginOrServices: ClientPlugin | ClientPlugin[] | ClientServices): this {
+    if (Array.isArray(pluginOrServices)) {
+      for (const plugin of pluginOrServices) {
+        if (!isObjectRecord(plugin)) throw new TypeError("Each client plugin must be an object");
+        this.plugins.push(plugin as ClientPlugin);
+      }
+    } else if (isObjectRecord(pluginOrServices) &&
+      ("onRequest" in pluginOrServices || "onResponse" in pluginOrServices || "onError" in pluginOrServices)) {
+      this.plugins.push(pluginOrServices as ClientPlugin);
+    } else {
+      for (const [name, service] of Object.entries(pluginOrServices)) {
+        if (typeof service !== "function") throw new TypeError(`Client service '${name}' must be a function`);
+        this.services.set(name, service as ClientService);
+      }
+    }
+    return this;
+  }
+
+  async call(request: ClientCallRequest): Promise<unknown> {
+    if (!request.url) throw new TypeError("Client.call requires url");
+    const initialUrl = new URL(request.url);
+    const initialBody = { params: request.params ?? {}, data: request.data ?? null };
+    let response = await this.send(initialUrl.toString(), initialBody, request.headers ?? {}, "initial");
+
+    while (true) {
+      const protocol = response.body;
+      if (!isObjectRecord(protocol) || protocol.protocol !== 1 || typeof protocol.done !== "boolean") {
+        throw new Error("Server returned an invalid negotiation response");
+      }
+      if (protocol.done) {
+        if (isObjectRecord(protocol.error)) {
+          const error = new Error(String(protocol.error.message ?? "Server request failed"));
+          (error as Error & { code: string }).code = String(protocol.error.code ?? "SERVER_ERROR");
+          throw error;
+        }
+        return protocol.result;
+      }
+
+      if (typeof protocol.jobId !== "string" || typeof protocol.resumeUrl !== "string" || typeof protocol.resumeToken !== "string") {
+        throw new Error("Negotiation response is missing jobId, resumeUrl, or resumeToken");
+      }
+      if (!Array.isArray(protocol.actions)) throw new Error("Negotiation response actions must be an array");
+
+      const results = await Promise.all(protocol.actions.map((action) => this.executeAction(action as ClientAction)));
+      const resumeUrl = new URL(protocol.resumeUrl, initialUrl).toString();
+      response = await this.send(
+        resumeUrl,
+        {
+          jobId: protocol.jobId,
+          round: protocol.round,
+          resumeToken: protocol.resumeToken,
+          results,
+        },
+        request.headers ?? {},
+        "resume",
+      );
+    }
+  }
+
+  private async executeAction(action: ClientAction): Promise<ActionResult> {
+    if (!action || typeof action.name !== "string" || typeof action.callbackID !== "string") {
+      return {
+        callbackID: String((action as any)?.callbackID ?? "invalid"),
+        ok: false,
+        error: { code: "INVALID_ACTION", message: "Malformed action received from server" },
+      };
+    }
+    const service = this.services.get(action.name);
+    if (!service) {
+      return {
+        callbackID: action.callbackID,
+        ok: false,
+        error: { code: "SERVICE_NOT_FOUND", message: `No client service registered for '${action.name}'` },
+      };
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(Object.assign(new Error(`Service '${action.name}' timed out`), { code: "SERVICE_TIMEOUT" })), this.serviceTimeoutMs);
+      });
+      const result = await Promise.race([Promise.resolve().then(() => service(action.data)), timeout]);
+      return { callbackID: action.callbackID, ok: true, result };
+    } catch (error) {
+      return { callbackID: action.callbackID, ok: false, error: errorPayload(error) };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async send(
+    url: string,
+    body: unknown,
+    extraHeaders: Record<string, string>,
+    phase: "initial" | "resume",
+  ): Promise<{ body: unknown; status: number; headers: Record<string, string> }> {
+    let outgoing: HttpPluginRequest = {
+      url,
+      method: "POST",
+      headers: { "content-type": "application/json", ...extraHeaders },
+      body,
+      phase,
+    };
+    for (const plugin of this.plugins) {
+      if (plugin.onRequest) {
+        const changed = await plugin.onRequest(outgoing);
+        if (changed) outgoing = changed;
+      }
+    }
+
+    try {
+      const fetchResponse = await fetch(outgoing.url, {
+        method: outgoing.method,
+        headers: outgoing.headers,
+        body: JSON.stringify(outgoing.body),
+        signal: AbortSignal.timeout(this.requestTimeoutMs),
+      });
+      const text = await fetchResponse.text();
+      let responseBody: unknown;
+      try {
+        responseBody = text ? JSON.parse(text) : null;
+      } catch {
+        throw new Error(`Expected JSON from ${outgoing.url}, received non-JSON response (HTTP ${fetchResponse.status})`);
+      }
+      const meta: HttpPluginResponse = {
+        url: outgoing.url,
+        status: fetchResponse.status,
+        headers: responseHeaders(fetchResponse),
+        phase,
+      };
+      for (const plugin of this.plugins) {
+        if (plugin.onResponse) {
+          const changed = await plugin.onResponse(responseBody, meta);
+          if (changed !== undefined) responseBody = changed;
+        }
+      }
+      if (!fetchResponse.ok) {
+        const detail = isObjectRecord(responseBody) && isObjectRecord(responseBody.error)
+          ? String(responseBody.error.message ?? fetchResponse.statusText)
+          : fetchResponse.statusText;
+        throw new Error(`HTTP ${fetchResponse.status}: ${detail}`);
+      }
+      return { body: responseBody, status: fetchResponse.status, headers: meta.headers };
+    } catch (error) {
+      const converted = toError(error);
+      for (const plugin of this.plugins) {
+        await plugin.onError?.(converted, outgoing);
+      }
+      throw converted;
+    }
+  }
+}
+
+export const Client = new NegotiationClient();
+export const Server = new NegotiationServer();
