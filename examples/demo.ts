@@ -108,17 +108,17 @@ server.handle("/delivery/estimate", async (request) => {
   const area = location?.area ?? input.deliveryArea;
 
   // A server-side action is called with normal await: no callback IDs involved.
-  const slots = await server.call<Slot[]>("delivery.getAvailableSlots", {
+  const slots = await server.run.delivery.getAvailableSlots({
     area,
     period: preferences.preferredPeriod,
-  });
+  }) as Slot[];
 
   // One service call; Server creates and tracks the callback ID internally.
-  const selected = await server.require<{ slotId: string }>("selectDeliverySlot", {
+  const selected = await server.ask.selectDeliverySlot({
     orderId: input.orderId,
     slots,
     fragileHandling: preferences.fragileHandling,
-  });
+  }) as { slotId: string };
 
   const selectedSlot = slots.find((slot) => slot.id === selected.slotId);
   if (!selectedSlot) throw new Error("The client selected an invalid delivery slot");

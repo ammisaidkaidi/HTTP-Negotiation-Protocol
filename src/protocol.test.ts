@@ -288,3 +288,51 @@ test("MemoryRequestStore evicts oldest entries beyond its bound", async () => {
   assert.equal(store.records.has("a"), false);
   assert.equal(store.records.has("c"), true);
 });
+
+test("v1.3 magic proxy syntax: server.ask.* and server.run.* replace string names", async () => {
+  const server = new NegotiationServer({ requestTimeoutMs: 5_000 });
+  server.use({
+    "math.add": async ({ a, b }: any) => Number(a) + Number(b),
+    "delivery.getAvailableSlots": async () => ["slot_1", "slot_2"],
+  });
+  server.handle("/test", async () => {
+    const name: string = await server.ask.getName();
+    const area: string = await server.ask.location.getArea({ precise: false });
+    const sum: number = await server.run.math.add({ a: 2, b: 3 });
+    const sumFuzzy: number = await server.run.mathAdd({ a: 1, b: 1 });
+    const slots: string[] = await server.run.getAvailableSlots({});
+    const slotsNested: string[] = await server.run.delivery.getAvailableSlots({});
+    return { name, area, sum, sumFuzzy, slots, slotsNested };
+  });
+  const client = new NegotiationClient();
+  client.use({
+    getName: async () => "Alex",
+    "location.getArea": async () => "Ghardaia-Centre",
+  });
+  await withServer(server, async (baseUrl) => {
+    const result = await client.call({ url: `${baseUrl}/test`, data: {} });
+    assert.deepEqual(result, {
+      name: "Alex",
+      area: "Ghardaia-Centre",
+      sum: 5,
+      sumFuzzy: 2,
+      slots: ["slot_1", "slot_2"],
+      slotsNested: ["slot_1", "slot_2"],
+    });
+  });
+});
+
+test("magic proxy surfaces unknown and ambiguous action errors", async () => {
+  const server = new NegotiationServer({ requestTimeoutMs: 5_000 });
+  server.use({
+    "a.get": async () => 1,
+    "b.get": async () => 2,
+  });
+  server.handle("/unknown", async () => server.run.nope());
+  server.handle("/ambiguous", async () => server.run.get());
+  const client = new NegotiationClient();
+  await withServer(server, async (baseUrl) => {
+    await assert.rejects(client.call({ url: `${baseUrl}/unknown`, data: {} }), /Unknown server action/);
+    await assert.rejects(client.call({ url: `${baseUrl}/ambiguous`, data: {} }), /Ambiguous server action/);
+  });
+});

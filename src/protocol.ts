@@ -395,6 +395,30 @@ export class ServerActionInvocation<T = unknown> implements PromiseLike<T> {
   }
 }
 
+/**
+ * Magic client-service proxy (v1.3 syntax). Property access builds the
+ * service name, calling it executes the service:
+ *
+ *   await server.ask.getName()            // -> server.require("getName")
+ *   await server.ask.location.get()       // -> server.require("location.get")
+ */
+// Intentionally `any`: a dynamic proxy cannot be statically typed per
+// service name, and `noUncheckedIndexedAccess` would otherwise force `!`
+// on every access (defeating the short syntax). Annotate at the call site
+// instead, e.g. `const name: string = await server.ask.getName();`.
+export type ClientServiceProxy = any;
+
+/**
+ * Magic server-action proxy (v1.3 syntax). Nested properties build dotted
+ * action names, and a bare leaf name resolves by suffix:
+ *
+ *   await server.run.math.add({ a: 2, b: 3 })         // -> "math.add"
+ *   await server.run.getAvailableSlots({ ... })       // -> "delivery.getAvailableSlots"
+ *   await server.run.mathAdd({ a: 2, b: 3 })          // -> "math.add" (normalised match)
+ */
+/** See {@link ClientServiceProxy}: intentionally dynamic (`any`). */
+export type ServerActionProxy = any;
+
 export class NegotiationServer {
   private readonly storage = new AsyncLocalStorage<JobContext>();
   private readonly routes = new Map<string, RouteHandler>();
@@ -466,6 +490,60 @@ export class NegotiationServer {
       this.actions.set(name, action);
     }
     return this;
+  }
+
+  /** Magic proxy for client services: `await server.ask.getName(data)`. */
+  get ask(): ClientServiceProxy {
+    return this.createPathProxy([], async (path, data) => {
+      if (!path) throw new TypeError("server.ask must be called on a service name, e.g. server.ask.getName()");
+      return this.require(path, data);
+    }) as ClientServiceProxy;
+  }
+
+  /** Magic proxy for server actions: `await server.run.math.add(data)`. */
+  get run(): ServerActionProxy {
+    return this.createPathProxy([], async (path, data) => {
+      if (!path) throw new TypeError("server.run must be called on an action name, e.g. server.run.math.add()");
+      return await this.call(this.resolveServerActionName(path), data);
+    }) as ServerActionProxy;
+  }
+
+  private resolveServerActionName(path: string): string {
+    if (this.actions.has(path)) return path;
+    const suffix = [...this.actions.keys()].filter((key) => key.endsWith(`.${path}`));
+    if (suffix.length === 1) return suffix[0] as string;
+    if (suffix.length > 1) {
+      throw new Error(`Ambiguous server action '${path}' (matches: ${suffix.join(", ")}); use the full dotted name`);
+    }
+    const normalize = (value: string) => value.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+    const wanted = normalize(path);
+    const fuzzy = [...this.actions.keys()].filter((key) => {
+      const candidate = normalize(key);
+      return candidate === wanted || candidate.endsWith(wanted);
+    });
+    if (fuzzy.length === 1) return fuzzy[0] as string;
+    if (fuzzy.length > 1) {
+      throw new Error(`Ambiguous server action '${path}' (matches: ${fuzzy.join(", ")}); use the full dotted name`);
+    }
+    return path; // Let call() produce the standard "Unknown server action" error.
+  }
+
+  private createPathProxy(
+    segments: string[],
+    invoke: (path: string, data?: unknown) => Promise<unknown>,
+  ): unknown {
+    const callable = (data?: unknown) => invoke(segments.join("."), data);
+    return new Proxy(callable, {
+      get: (target, prop) => {
+        if (typeof prop !== "string") return Reflect.get(target, prop);
+        // Never become a thenable / never shadow real Function members.
+        if (prop === "then" || prop === "catch" || prop === "finally" || prop in target) {
+          return Reflect.get(target, prop);
+        }
+        return this.createPathProxy([...segments, prop], invoke);
+      },
+      apply: (_target, _thisArg, args) => invoke(segments.join("."), args[0] as unknown),
+    });
   }
 
   async listen(port = 3000, host = "127.0.0.1"): Promise<void> {

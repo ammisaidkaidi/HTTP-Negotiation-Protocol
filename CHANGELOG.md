@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-10-13
+
+### Added
+
+- Magic proxy syntax: `server.ask.<service>(data)` for client services and
+  `server.run.<action>(data)` for server actions (nested dotted names,
+  bare-leaf suffix resolution, and normalised names such as `mathAdd`).
+  The classic string-based API remains fully backwards-compatible.
+
 ## [1.2.0] - 2026-10-13
 
 ### Added

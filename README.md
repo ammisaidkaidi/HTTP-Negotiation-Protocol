@@ -30,7 +30,41 @@ DATABASE_URL="postgres://user:password@localhost:5432/mydb" npm start
 
 For external callbacks from another machine, set `PUBLIC_BASE_URL` to a publicly reachable HTTPS URL and secure the application or reverse proxy. The generated callback URL contains an unguessable token, but this is not a substitute for your provider's signature verification where available.
 
-## Minimal API
+## Shortest syntax (v1.3.0, magic proxies)
+
+No string service/action names inside routes, and `return` replaces `server.end()`:
+
+```ts
+import { NegotiationClient, NegotiationServer } from "http-negotiation-protocol";
+
+const server = new NegotiationServer();
+const client = new NegotiationClient();
+
+server.use({ "math.add": ({ a, b }) => a + b });
+
+server.handle("/example", async () => {
+  const name = await server.ask.getName();          // client service "getName"
+  const sum = await server.run.math.add({ a: 2, b: 3 }); // server action "math.add"
+  return { name, sum };                             // returning a value auto-ends the job
+});
+
+client.use({ getName: async () => "Alex" });
+
+await server.listen(3000);
+const result = await client.call({ url: "http://127.0.0.1:3000/example", data: {} });
+console.log(result); // { name: "Alex", sum: 5 }
+await server.close();
+```
+
+Proxy rules:
+
+- `server.ask.<name>(data)` → `server.require("<name>", data)`; nest for dots: `server.ask.location.get()` → `"location.get"`.
+- `server.run.<name>(data)` → server actions; nest for dots (`server.run.math.add()`), use a bare leaf (`server.run.getAvailableSlots()` resolves `"delivery.getAvailableSlots"`), or a normalised name (`server.run.mathAdd()` → `"math.add"`). Ambiguous leaf names throw — use the full dotted path.
+- The classic string API (`server.require(...)`, `server.call(...)`, `server.end(...)`,
+  `server.requireMany(...)` for parallel calls with `fallback`) remains fully supported
+  and is still the way to pass fallbacks, explicit types, or low-level action results.
+
+## Minimal API (classic syntax)
 
 ```ts
 import { NegotiationClient, NegotiationServer } from "http-negotiation-protocol";
