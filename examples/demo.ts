@@ -6,7 +6,7 @@ import {
   type ClientPlugin,
   type HttpPluginRequest,
   type HttpPluginResponse,
-} from "./protocol.js";
+} from "../src/protocol.js";
 
 const port = Number(process.env.PORT ?? 3000);
 const publicBaseUrl = process.env.PUBLIC_BASE_URL ?? `http://127.0.0.1:${port}`;

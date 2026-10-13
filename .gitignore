@@ -1,10 +1,12 @@
 node_modules/
 dist/
+dist-examples/
 build/
 out/
+coverage/
 .env
 .env.*
 !.env.example
 .DS_Store
 *.log
-coverage/
+*.tsbuildinfo

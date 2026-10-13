@@ -33,7 +33,7 @@ For external callbacks from another machine, set `PUBLIC_BASE_URL` to a publicly
 ## Minimal API
 
 ```ts
-import { NegotiationClient, NegotiationServer } from "./protocol.js";
+import { NegotiationClient, NegotiationServer } from "http-negotiation-protocol";
 
 const server = new NegotiationServer();
 const client = new NegotiationClient();
@@ -87,6 +87,52 @@ await server.close();
 - Results are matched to the expected callback IDs; repeated external callbacks are acknowledged without settling the callback again.
 - `Server.end(result)` saves the original request and final response through the configured `RequestStore`.
 - Active jobs are held in memory. This version targets one server process; it does not recover pending jobs after a restart or coordinate multiple replicas.
+
+## Options (v1.2.0)
+
+### Server — `new NegotiationServer({...})`
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `maxBodyBytes` | `1_000_000` | Maximum JSON request body size |
+| `requestTimeoutMs` | `120_000` | Timeout for one negotiation round / external callback |
+| `jobTimeoutMs` | `600_000` | Overall lifetime of one logical job (`JOB_EXPIRED` afterwards) |
+| `maxJobs` | `1000` | Maximum active jobs; new jobs get HTTP `503 TOO_MANY_JOBS` beyond this |
+| `onError(error, { jobId, path, phase })` | — | Structured error hook |
+
+### Client — `new NegotiationClient({...})` / `client.call({...})`
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `serviceTimeoutMs` | `60_000` | Timeout for one client service |
+| `requestTimeoutMs` | `120_000` | Timeout for one HTTP request |
+| `maxRounds` | `100` | Round cap per logical call (`MAX_ROUNDS_EXCEEDED`; also per-call) |
+| `maxResponseBytes` | `1_000_000` | Maximum accepted response size (`RESPONSE_TOO_LARGE`) |
+| `signal` (per call) | — | `AbortSignal` cancelling the whole logical call |
+
+## Security behaviour (v1.2.0)
+
+- Resume tokens are **rotated every round** and are single-round; callback and
+  resume tokens are stored only as SHA-256 hashes and compared in constant time.
+- Sensitive headers (`Authorization`, `Cookie`, `x-api-key`, …) are persisted
+  as `[REDACTED]` — credentials are never written to a `RequestStore`.
+- Abandoned jobs expire instead of leaking in memory, and `server.close()`
+  rejects pending rounds/callbacks instead of hanging.
+
+## Development
+
+```bash
+npm install
+npm run lint       # ESLint
+npm run typecheck  # strict TypeScript (incl. noUncheckedIndexedAccess)
+npm test           # node:test via tsx (9 tests)
+npm run build      # library only -> dist/ (declarations + source maps)
+npm run demo       # examples/demo.ts
+```
+
+Publishing: the package entry point is `dist/index.js` (`exports` map in
+`package.json`); `.github/workflows/publish.yml` publishes to npm on a GitHub
+Release using the `NPM_TOKEN` repository secret.
 
 ## Production considerations
 

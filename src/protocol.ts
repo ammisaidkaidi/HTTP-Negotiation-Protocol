@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   createServer as createHttpServer,
   type IncomingMessage,
@@ -15,6 +15,10 @@ export interface ClientCallRequest {
   params?: Record<string, string | number | boolean | null | undefined>;
   data?: unknown;
   headers?: Record<string, string>;
+  /** Cancels the whole logical call (HTTP requests and in-flight client services). */
+  signal?: AbortSignal;
+  /** Overrides NegotiationClientOptions.maxRounds for this call. */
+  maxRounds?: number;
 }
 
 export interface ServerRequest {
@@ -107,8 +111,22 @@ export interface RequestStore {
 export class MemoryRequestStore implements RequestStore {
   readonly records = new Map<string, StoredRequestResponse>();
 
+  /** Bounded in-memory store: oldest entries are evicted beyond maxRecords. */
+  constructor(private readonly maxRecords = 1_000) {
+    if (!Number.isInteger(maxRecords) || maxRecords < 1) {
+      throw new TypeError("MemoryRequestStore maxRecords must be a positive integer");
+    }
+  }
+
   async save(entry: StoredRequestResponse): Promise<void> {
+    // Delete first so re-saving a job refreshes its eviction order.
+    this.records.delete(entry.jobId);
     this.records.set(entry.jobId, structuredClone(entry));
+    while (this.records.size > this.maxRecords) {
+      const oldest = this.records.keys().next().value;
+      if (oldest === undefined) break;
+      this.records.delete(oldest);
+    }
   }
 }
 
@@ -121,6 +139,7 @@ interface PgPoolLike {
 export class PostgresRequestStore implements RequestStore {
   private readonly poolPromise: Promise<PgPoolLike>;
   private initialized = false;
+  private initPromise: Promise<void> | undefined;
 
   constructor(connectionString?: string) {
     // Use a variable import so PostgreSQL types are not required by consumers
@@ -131,16 +150,28 @@ export class PostgresRequestStore implements RequestStore {
 
   private async init(): Promise<void> {
     if (this.initialized) return;
-    const pool = await this.poolPromise;
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS negotiation_logs (
-        job_id TEXT PRIMARY KEY,
-        request JSONB NOT NULL,
-        response JSONB NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    this.initialized = true;
+    // Share one initialisation across concurrent save() calls.
+    this.initPromise ??= (async () => {
+      const pool = await this.poolPromise;
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS negotiation_logs (
+          job_id TEXT PRIMARY KEY,
+          request JSONB NOT NULL,
+          response JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(
+        `CREATE INDEX IF NOT EXISTS negotiation_logs_created_at_idx ON negotiation_logs (created_at)`,
+      );
+      this.initialized = true;
+    })();
+    try {
+      await this.initPromise;
+    } catch (error) {
+      this.initPromise = undefined; // Allow a later save() to retry.
+      throw error;
+    }
   }
 
   async save(entry: StoredRequestResponse): Promise<void> {
@@ -163,7 +194,11 @@ export class PostgresRequestStore implements RequestStore {
   }
 
   async close(): Promise<void> {
-    await (await this.poolPromise).end();
+    try {
+      await (await this.poolPromise).end();
+    } catch {
+      // Pool never started (e.g. optional `pg` dependency missing): nothing to close.
+    }
   }
 }
 
@@ -173,6 +208,12 @@ export interface NegotiationServerOptions {
   store?: RequestStore;
   maxBodyBytes?: number;
   requestTimeoutMs?: number;
+  /** Maximum simultaneously active jobs; new jobs get HTTP 503 beyond this. Default 1000. */
+  maxJobs?: number;
+  /** Overall lifetime of one logical job, across all rounds/callbacks. Default 600_000 (10 min). */
+  jobTimeoutMs?: number;
+  /** Structured error hook (replaces ad-hoc console logging). */
+  onError?: (error: Error, info: { jobId?: string; path?: string; phase: string }) => void;
 }
 
 interface Deferred<T> {
@@ -206,6 +247,35 @@ function errorPayload(value: unknown): { code: string; message: string } {
 
 function headerRecord(headers: IncomingMessage["headers"]): ServerRequest["headers"] {
   return { ...headers };
+}
+
+const SENSITIVE_HEADERS = new Set([
+  "authorization",
+  "cookie",
+  "set-cookie",
+  "proxy-authorization",
+  "x-api-key",
+  "x-auth-token",
+]);
+
+/** Copy of a request safe to persist: credentials are never written to a RequestStore. */
+function redactedRequestForStorage(request: ServerRequest): ServerRequest {
+  const headers: ServerRequest["headers"] = {};
+  for (const [name, value] of Object.entries(request.headers)) {
+    headers[name] = SENSITIVE_HEADERS.has(name.toLowerCase()) ? "[REDACTED]" : value;
+  }
+  return { ...request, headers };
+}
+
+/** Tokens are only ever stored as SHA-256 hashes and compared in constant time. */
+function tokenHash(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function tokensMatch(storedHash: string, providedToken: string): boolean {
+  const expected = Buffer.from(storedHash, "hex");
+  const actual = Buffer.from(tokenHash(providedToken), "hex");
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
 }
 
 function responseHeaders(res: Response): Record<string, string> {
@@ -278,14 +348,16 @@ interface PendingRound {
 }
 
 interface ExternalCallback {
-  token: string;
+  tokenHash: string;
   result: Deferred<unknown>;
   settled: boolean;
 }
 
 interface JobContext {
   jobId: string;
-  resumeToken: string;
+  /** SHA-256 hash only; the plain token exists solely in the response that issued it. */
+  resumeTokenHash: string;
+  expiryTimer?: ReturnType<typeof setTimeout>;
   request: ServerRequest;
   currentResponse: ServerResponse | null;
   round: number;
@@ -335,6 +407,9 @@ export class NegotiationServer {
   private readonly defaultCallbackPath: string;
   private readonly maxBodyBytes: number;
   private readonly requestTimeoutMs: number;
+  private readonly maxJobs: number;
+  private readonly jobTimeoutMs: number;
+  private readonly onError: NegotiationServerOptions["onError"];
 
   constructor(options: NegotiationServerOptions = {}) {
     this.store = options.store ?? new MemoryRequestStore();
@@ -343,6 +418,37 @@ export class NegotiationServer {
     this.callbackPaths.add(new URL(this.defaultCallbackPath, "http://localhost").pathname);
     this.maxBodyBytes = options.maxBodyBytes ?? 1_000_000;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 120_000;
+    this.maxJobs = options.maxJobs ?? 1_000;
+    this.jobTimeoutMs = options.jobTimeoutMs ?? 600_000;
+    this.onError = options.onError;
+  }
+
+  private reportError(error: unknown, info: { jobId?: string; path?: string; phase: string }): void {
+    try {
+      this.onError?.(toError(error), info);
+    } catch {
+      // An error hook must never break request handling.
+    }
+  }
+
+  private expireJob(context: JobContext): void {
+    if (context.ended) return;
+    const error = Object.assign(
+      new Error(`Negotiation job ${context.jobId} exceeded its maximum lifetime`),
+      { code: "JOB_EXPIRED" },
+    );
+    if (context.pending) {
+      const pending = context.pending;
+      context.pending = undefined;
+      pending.reject(error);
+    }
+    for (const callback of context.externalCallbacks.values()) {
+      if (!callback.settled) {
+        callback.settled = true;
+        callback.result.reject(error);
+      }
+    }
+    this.jobs.delete(context.jobId);
   }
 
   /** Register an HTTP route that participates in negotiation. */
@@ -379,11 +485,34 @@ export class NegotiationServer {
   }
 
   async close(): Promise<void> {
+    // Fail every suspended job first so handlers unwind instead of hanging.
+    const shutdownError = Object.assign(new Error("Negotiation server is shutting down"), {
+      code: "SERVER_SHUTDOWN",
+    });
+    for (const context of this.jobs.values()) {
+      if (context.expiryTimer) clearTimeout(context.expiryTimer);
+      context.ended = true;
+      if (context.pending) {
+        const pending = context.pending;
+        context.pending = undefined;
+        pending.reject(shutdownError);
+      }
+      for (const callback of context.externalCallbacks.values()) {
+        if (!callback.settled) {
+          callback.settled = true;
+          callback.result.reject(shutdownError);
+        }
+      }
+    }
+    this.jobs.clear();
     if (this.httpServer) {
-      await new Promise<void>((resolve, reject) => {
-        this.httpServer!.close((error) => (error ? reject(error) : resolve()));
-      });
+      const server = this.httpServer;
       this.httpServer = undefined;
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+        // Do not let idle keep-alive sockets stall shutdown.
+        server.closeAllConnections?.();
+      });
     }
     await this.store.close?.();
   }
@@ -412,6 +541,7 @@ export class NegotiationServer {
       const [result] = await this.requestClientActions([
         { name: input, data, callbackID: `cb_${randomUUID()}` },
       ]);
+      if (!result) throw new Error(`Missing result for client action '${input}'`);
       return unwrapActionResult(result) as T;
     }
     if (Array.isArray(input)) {
@@ -423,6 +553,7 @@ export class NegotiationServer {
       }));
       const results = await this.requestClientActions(actions);
       return results.map((result, index) => {
+        if (!result) throw new Error(`Missing result for client action at index ${index}`);
         if (result.ok) return result.result;
         const descriptor = input[index];
         if (descriptor && Object.prototype.hasOwnProperty.call(descriptor, "fallback")) {
@@ -462,6 +593,10 @@ export class NegotiationServer {
       reject: wait.reject,
     };
 
+    // Rotate the resume token every round: a leaked token can only ever
+    // resume the single round it was issued for, and only once.
+    const resumeToken = randomUUID();
+    context.resumeTokenHash = tokenHash(resumeToken);
     const response: NegotiationResponse = {
       protocol: 1,
       jobId: context.jobId,
@@ -470,7 +605,7 @@ export class NegotiationServer {
       result: null,
       actions: inputActions,
       resumeUrl: "/__negotiation/resume",
-      resumeToken: context.resumeToken,
+      resumeToken,
     };
     this.sendProtocolResponse(context, response);
 
@@ -541,7 +676,7 @@ export class NegotiationServer {
 
     const wait = deferred<T>();
     context.externalCallbacks.set(callbackID, {
-      token,
+      tokenHash: tokenHash(token),
       result: wait as Deferred<unknown>,
       settled: false,
     });
@@ -578,6 +713,7 @@ export class NegotiationServer {
   async end(result?: unknown): Promise<void> {
     const context = this.requireContext();
     if (context.ended) return;
+    if (context.expiryTimer) clearTimeout(context.expiryTimer);
     if (arguments.length > 0) {
       context.result = result;
       context.resultSet = true;
@@ -593,7 +729,7 @@ export class NegotiationServer {
     };
     await this.store.save({
       jobId: context.jobId,
-      request: context.request,
+      request: redactedRequestForStorage(context.request),
       response,
       createdAt: context.startedAt,
     });
@@ -631,6 +767,7 @@ export class NegotiationServer {
   }
 
   private cleanupWhenFinished(context: JobContext): void {
+    if (context.expiryTimer) clearTimeout(context.expiryTimer);
     const response = context.currentResponse;
     if (!response) {
       this.jobs.delete(context.jobId);
@@ -673,6 +810,10 @@ export class NegotiationServer {
       sendJson(res, 404, { ok: false, error: { code: "NOT_FOUND", message: `No route: ${url.pathname}` } });
       return;
     }
+    if (this.jobs.size >= this.maxJobs) {
+      sendJson(res, 503, { ok: false, error: { code: "TOO_MANY_JOBS", message: "Too many active negotiation jobs" } });
+      return;
+    }
 
     let body: any;
     try {
@@ -681,11 +822,15 @@ export class NegotiationServer {
       sendJson(res, 400, { ok: false, error: errorPayload(error) });
       return;
     }
+    if (!isObjectRecord(body)) {
+      sendJson(res, 400, { ok: false, error: { code: "INVALID_BODY", message: "Request body must be a JSON object" } });
+      return;
+    }
 
     const jobId = randomUUID();
     const context: JobContext = {
       jobId,
-      resumeToken: randomUUID(),
+      resumeTokenHash: tokenHash(randomUUID()),
       request: {
         jobId,
         method: req.method,
@@ -706,6 +851,8 @@ export class NegotiationServer {
       startedAt: new Date().toISOString(),
     };
     this.jobs.set(jobId, context);
+    context.expiryTimer = setTimeout(() => this.expireJob(context), this.jobTimeoutMs);
+    context.expiryTimer.unref?.();
 
     // The handler remains suspended at Server.require() while separate HTTP requests resume it.
     await this.storage.run(context, async () => {
@@ -732,13 +879,17 @@ export class NegotiationServer {
       sendJson(res, 400, { ok: false, error: errorPayload(error) });
       return;
     }
+    if (!isObjectRecord(body)) {
+      sendJson(res, 400, { ok: false, error: { code: "INVALID_BODY", message: "Request body must be a JSON object" } });
+      return;
+    }
 
     const context = this.jobs.get(String(body.jobId ?? ""));
     if (!context || context.ended) {
       sendJson(res, 404, { ok: false, error: { code: "UNKNOWN_JOB", message: "Job not found or already finished" } });
       return;
     }
-    if (body.resumeToken !== context.resumeToken) {
+    if (typeof body.resumeToken !== "string" || !tokensMatch(context.resumeTokenHash, body.resumeToken)) {
       sendJson(res, 403, { ok: false, error: { code: "INVALID_RESUME_TOKEN", message: "Invalid resume token" } });
       return;
     }
@@ -812,7 +963,7 @@ export class NegotiationServer {
     const token = url.searchParams.get("token") ?? "";
     const context = this.jobs.get(jobId);
     const callback = context?.externalCallbacks.get(callbackID);
-    if (!context || !callback || callback.token !== token) {
+    if (!context || !callback || !tokensMatch(callback.tokenHash, token)) {
       sendJson(res, 403, { ok: false, error: { code: "INVALID_CALLBACK", message: "Unknown callback or invalid token" } });
       return;
     }
@@ -837,15 +988,16 @@ export class NegotiationServer {
       error: errorPayload(error),
       actions: [],
     };
+    if (context.expiryTimer) clearTimeout(context.expiryTimer);
     try {
       await this.store.save({
         jobId: context.jobId,
-        request: context.request,
+        request: redactedRequestForStorage(context.request),
         response,
         createdAt: context.startedAt,
       });
     } catch (storeError) {
-      console.error("Failed to save negotiation log:", toError(storeError).message);
+      this.reportError(storeError, { jobId: context.jobId, path: context.request.path, phase: "store" });
     }
     context.ended = true;
     context.latestOutgoing = response;
@@ -862,6 +1014,10 @@ export class NegotiationServer {
 export interface NegotiationClientOptions {
   serviceTimeoutMs?: number;
   requestTimeoutMs?: number;
+  /** Maximum negotiation rounds per logical call; guards against server loops. Default 100. */
+  maxRounds?: number;
+  /** Maximum accepted response body size in bytes. Default 1_000_000. */
+  maxResponseBytes?: number;
 }
 
 export class NegotiationClient {
@@ -869,10 +1025,14 @@ export class NegotiationClient {
   private readonly services = new Map<string, ClientService>();
   private readonly serviceTimeoutMs: number;
   private readonly requestTimeoutMs: number;
+  private readonly maxRounds: number;
+  private readonly maxResponseBytes: number;
 
   constructor(options: NegotiationClientOptions = {}) {
     this.serviceTimeoutMs = options.serviceTimeoutMs ?? 60_000;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 120_000;
+    this.maxRounds = options.maxRounds ?? 100;
+    this.maxResponseBytes = options.maxResponseBytes ?? 1_000_000;
   }
 
   /** Register one/many HTTP plugins, or a map of named client-side services. */
@@ -896,15 +1056,33 @@ export class NegotiationClient {
 
   async call(request: ClientCallRequest): Promise<unknown> {
     if (!request.url) throw new TypeError("Client.call requires url");
+    const maxRounds = request.maxRounds ?? this.maxRounds;
+    if (!Number.isInteger(maxRounds) || maxRounds < 1) {
+      throw new TypeError("maxRounds must be a positive integer");
+    }
     const initialUrl = new URL(request.url);
     const initialBody = { params: request.params ?? {}, data: request.data ?? null };
-    let response = await this.send(initialUrl.toString(), initialBody, request.headers ?? {}, "initial");
+    let response = await this.send(initialUrl.toString(), initialBody, request.headers ?? {}, "initial", request.signal);
 
+    let rounds = 0;
+    let lastRound = 0;
     while (true) {
+      if (request.signal?.aborted) {
+        throw request.signal.reason instanceof Error
+          ? request.signal.reason
+          : Object.assign(new Error("Client.call was aborted"), { code: "ABORTED" });
+      }
       const protocol = response.body;
       if (!isObjectRecord(protocol) || protocol.protocol !== 1 || typeof protocol.done !== "boolean") {
         throw new Error("Server returned an invalid negotiation response");
       }
+      if (typeof protocol.round !== "number" || !Number.isInteger(protocol.round) || protocol.round < 0) {
+        throw new Error("Negotiation response round must be a non-negative integer");
+      }
+      if (!protocol.done && protocol.round <= lastRound) {
+        throw new Error(`Negotiation round did not advance (received round ${protocol.round} after ${lastRound})`);
+      }
+      lastRound = protocol.round;
       if (protocol.done) {
         if (isObjectRecord(protocol.error)) {
           const error = new Error(String(protocol.error.message ?? "Server request failed"));
@@ -919,7 +1097,14 @@ export class NegotiationClient {
       }
       if (!Array.isArray(protocol.actions)) throw new Error("Negotiation response actions must be an array");
 
-      const results = await Promise.all(protocol.actions.map((action) => this.executeAction(action as ClientAction)));
+      rounds += 1;
+      if (rounds > maxRounds) {
+        throw Object.assign(new Error(`Negotiation exceeded the maximum of ${maxRounds} rounds`), {
+          code: "MAX_ROUNDS_EXCEEDED",
+        });
+      }
+
+      const results = await Promise.all(protocol.actions.map((action) => this.executeAction(action as ClientAction, request.signal)));
       const resumeUrl = new URL(protocol.resumeUrl, initialUrl).toString();
       response = await this.send(
         resumeUrl,
@@ -931,11 +1116,12 @@ export class NegotiationClient {
         },
         request.headers ?? {},
         "resume",
+        request.signal,
       );
     }
   }
 
-  private async executeAction(action: ClientAction): Promise<ActionResult> {
+  private async executeAction(action: ClientAction, signal?: AbortSignal): Promise<ActionResult> {
     if (!action || typeof action.name !== "string" || typeof action.callbackID !== "string") {
       return {
         callbackID: String((action as any)?.callbackID ?? "invalid"),
@@ -953,10 +1139,17 @@ export class NegotiationClient {
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const timeout = new Promise<never>((_, reject) => {
+      const racers: Promise<unknown>[] = [Promise.resolve().then(() => service(action.data))];
+      racers.push(new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(Object.assign(new Error(`Service '${action.name}' timed out`), { code: "SERVICE_TIMEOUT" })), this.serviceTimeoutMs);
-      });
-      const result = await Promise.race([Promise.resolve().then(() => service(action.data)), timeout]);
+      }));
+      if (signal) {
+        racers.push(new Promise<never>((_, reject) => {
+          if (signal.aborted) reject(Object.assign(new Error("Client.call was aborted"), { code: "ABORTED" }));
+          else signal.addEventListener("abort", () => reject(Object.assign(new Error("Client.call was aborted"), { code: "ABORTED" })), { once: true });
+        }));
+      }
+      const result = await Promise.race(racers);
       return { callbackID: action.callbackID, ok: true, result };
     } catch (error) {
       return { callbackID: action.callbackID, ok: false, error: errorPayload(error) };
@@ -970,6 +1163,7 @@ export class NegotiationClient {
     body: unknown,
     extraHeaders: Record<string, string>,
     phase: "initial" | "resume",
+    signal?: AbortSignal,
   ): Promise<{ body: unknown; status: number; headers: Record<string, string> }> {
     let outgoing: HttpPluginRequest = {
       url,
@@ -986,13 +1180,19 @@ export class NegotiationClient {
     }
 
     try {
+      const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
       const fetchResponse = await fetch(outgoing.url, {
         method: outgoing.method,
         headers: outgoing.headers,
         body: JSON.stringify(outgoing.body),
-        signal: AbortSignal.timeout(this.requestTimeoutMs),
+        signal: signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal,
       });
       const text = await fetchResponse.text();
+      if (new TextEncoder().encode(text).length > this.maxResponseBytes) {
+        throw Object.assign(new Error(`Response from ${outgoing.url} exceeds ${this.maxResponseBytes} bytes`), {
+          code: "RESPONSE_TOO_LARGE",
+        });
+      }
       let responseBody: unknown;
       try {
         responseBody = text ? JSON.parse(text) : null;

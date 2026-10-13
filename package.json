@@ -1,24 +1,70 @@
 {
   "name": "http-negotiation-protocol",
-  "version": "1.1.0",
-  "private": true,
+  "version": "1.2.0",
   "description": "A minimal TypeScript HTTP request-negotiation protocol with client services and external callbacks.",
   "type": "module",
+  "license": "MIT",
+  "author": "ammisaidkaidi",
+  "homepage": "https://github.com/ammisaidkaidi/HTTP-Negotiation-Protocol#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ammisaidkaidi/HTTP-Negotiation-Protocol.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ammisaidkaidi/HTTP-Negotiation-Protocol/issues"
+  },
+  "keywords": [
+    "http",
+    "negotiation",
+    "protocol",
+    "typescript",
+    "webhook",
+    "callback"
+  ],
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol.d.ts",
+      "import": "./dist/protocol.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/demo.js",
-    "dev": "tsx src/demo.ts",
-    "test": "npm run build && node --test dist/protocol.test.js"
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "start": "tsx examples/demo.ts",
+    "dev": "tsx examples/demo.ts",
+    "demo": "tsx examples/demo.ts",
+    "test": "tsx --test src/protocol.test.ts",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build"
   },
   "devDependencies": {
+    "@eslint/js": "^9.0.0",
     "@types/node": "^22.15.0",
+    "eslint": "^9.0.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.0.0"
   },
   "optionalDependencies": {
     "pg": "^8.16.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
