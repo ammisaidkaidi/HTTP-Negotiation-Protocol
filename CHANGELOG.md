@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-10-13
+
+### Added
+
+- `server.attach(httpServer)` for framework mode: tracks an external HTTP
+  server so `server.httpServer` (new read-only getter) is set instead of
+  always `undefined`, HTTP `error` events go to `onError`, an external
+  `close` event cleans up pending jobs and the store exactly once, and
+  `server.close()` closes the attached server. `listen()` now uses the
+  same wiring.
+
+### Fixed
+
+- In Express/framework usage, `NegotiationServer.httpServer` was always
+  `undefined` and no close/error events were initialised, because
+  `listen()` was never called. Negotiation cleanup is now idempotent
+  (`shutdownNegotiation()`), so repeated `close()` calls close the store
+  only once.
+
 ## [1.7.0] - 2026-10-13
 
 ### Added

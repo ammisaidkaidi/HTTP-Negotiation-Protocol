@@ -31,6 +31,11 @@ app.use(server.requestHandler()); // mount at the root, after your own routes
 async function main(): Promise<void> {
   const port = Number(process.env.PORT ?? 3000);
   const http = createHttpServer(app);
+  // Attach so the negotiation server tracks this HTTP server: `httpServer`
+  // becomes set, close/error events are wired, and server.close() below
+  // closes the HTTP server too. (Without attach(), server.httpServer stays
+  // undefined and server.close() would only clean up jobs/store.)
+  server.attach(http);
   await new Promise<void>((resolve) => http.listen(port, "127.0.0.1", resolve));
   console.log(`Express + negotiation demo listening on http://127.0.0.1:${port}`);
 
@@ -44,10 +49,9 @@ async function main(): Promise<void> {
     });
     console.log("\nFINAL RESULT\n", JSON.stringify(result, null, 2));
   } finally {
-    await new Promise<void>((resolve, reject) =>
-      http.close((error) => (error ? reject(error) : resolve())),
-    );
-    await server.close(); // rejects pending jobs + closes the store; Express is yours
+    // Because of attach(), this one call closes the Express HTTP server,
+    // rejects any pending negotiation jobs, and closes the store.
+    await server.close();
   }
 }
 

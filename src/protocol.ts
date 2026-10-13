@@ -609,7 +609,8 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   private readonly jobs = new Map<string, JobContext>();
   private readonly callbackPaths = new Set<string>();
   private readonly store: RequestStore;
-  private httpServer: HttpServer | undefined;
+  private httpServerInstance: HttpServer | undefined;
+  private shutdownPromise: Promise<void> | undefined;
   private readonly publicBaseUrl: string | undefined;
   private readonly defaultCallbackPath: string;
   private readonly maxBodyBytes: number;
@@ -764,8 +765,10 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
    *   app.use(express.json());            // optional; pre-parsed bodies are honoured
    *   app.use(server.requestHandler());   // mount at the root
    *
-   * In this mode you own the HTTP server: call `server.close()` on shutdown
-   * to reject pending jobs and close the store (it will not touch yours).
+   * In this mode you own the HTTP server. Either call `server.attach(http)`
+   * to wire close/error events and let `server.close()` close it too, or
+   * close it yourself and call `server.close()` for jobs/store cleanup only
+   * (an unattached `close()` never touches your HTTP server).
    * Mount at the root: route matching uses the full request path.
    */
   requestHandler(): (req: IncomingMessage, res: ServerResponse) => void {
@@ -783,49 +786,103 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     }
   }
 
+  /**
+   * The underlying HTTP server when this instance owns one (`listen()`)
+   * or is attached to an external one (`attach()`); otherwise `undefined`.
+   */
+  get httpServer(): HttpServer | undefined {
+    return this.httpServerInstance;
+  }
+
+  /**
+   * Attach to an HTTP server you own, typically created around a framework
+   * app (Express/Koa/Fastify). This initialises the lifecycle wiring that
+   * framework mode otherwise lacks:
+   *
+   * - `httpServer` becomes inspectable (instead of always `undefined`);
+   * - server "error" events are forwarded to the `onError` option;
+   * - when the HTTP server emits "close" (for any reason), pending jobs are
+   *   rejected and the store is closed — exactly once;
+   * - `server.close()` also closes the attached HTTP server.
+   *
+   *   const http = createHttpServer(app);
+   *   server.attach(http);
+   *   http.listen(3000);
+   *   // on shutdown: await server.close();  // closes http too
+   *
+   * Without `attach()`, `close()` only cleans up jobs/store and never
+   * touches your HTTP server.
+   */
+  attach(httpServer: HttpServer): this {
+    if (this.httpServerInstance && this.httpServerInstance !== httpServer) {
+      throw new Error("NegotiationServer is already attached to an HTTP server");
+    }
+    if (this.httpServerInstance === httpServer) return this;
+    this.httpServerInstance = httpServer;
+    const onError = (error: Error) => this.reportError(error, { phase: "http-server" });
+    const onClose = () => {
+      httpServer.off("error", onError);
+      if (this.httpServerInstance === httpServer) this.httpServerInstance = undefined;
+      // External shutdown path: clean up jobs/store even if close() is never called.
+      void this.shutdownNegotiation();
+    };
+    httpServer.on("error", onError);
+    httpServer.once("close", onClose);
+    return this;
+  }
+
   async listen(port = 3000, host = "127.0.0.1"): Promise<void> {
-    if (this.httpServer) throw new Error("Server is already listening");
-    this.httpServer = createHttpServer(this.requestHandler());
+    if (this.httpServerInstance) throw new Error("Server is already listening");
+    const httpServer = createHttpServer(this.requestHandler());
+    this.attach(httpServer);
     await new Promise<void>((resolve, reject) => {
-      this.httpServer!.once("error", reject);
-      this.httpServer!.listen(port, host, () => {
-        this.httpServer!.off("error", reject);
+      httpServer.once("error", reject);
+      httpServer.listen(port, host, () => {
+        httpServer.off("error", reject);
         resolve();
       });
     });
   }
 
-  async close(): Promise<void> {
-    // Fail every suspended job first so handlers unwind instead of hanging.
-    const shutdownError = Object.assign(new Error("Negotiation server is shutting down"), {
-      code: "SERVER_SHUTDOWN",
-    });
-    for (const context of this.jobs.values()) {
-      if (context.expiryTimer) clearTimeout(context.expiryTimer);
-      context.ended = true;
-      if (context.pending) {
-        const pending = context.pending;
-        context.pending = undefined;
-        pending.reject(shutdownError);
-      }
-      for (const callback of context.externalCallbacks.values()) {
-        if (!callback.settled) {
-          callback.settled = true;
-          callback.result.reject(shutdownError);
+  /** Idempotent negotiation cleanup: reject pending work and close the store, once. */
+  private shutdownNegotiation(): Promise<void> {
+    this.shutdownPromise ??= (async () => {
+      // Fail every suspended job first so handlers unwind instead of hanging.
+      const shutdownError = Object.assign(new Error("Negotiation server is shutting down"), {
+        code: "SERVER_SHUTDOWN",
+      });
+      for (const context of this.jobs.values()) {
+        if (context.expiryTimer) clearTimeout(context.expiryTimer);
+        context.ended = true;
+        if (context.pending) {
+          const pending = context.pending;
+          context.pending = undefined;
+          pending.reject(shutdownError);
+        }
+        for (const callback of context.externalCallbacks.values()) {
+          if (!callback.settled) {
+            callback.settled = true;
+            callback.result.reject(shutdownError);
+          }
         }
       }
-    }
-    this.jobs.clear();
-    if (this.httpServer) {
-      const server = this.httpServer;
-      this.httpServer = undefined;
+      this.jobs.clear();
+      await this.store.close?.();
+    })();
+    return this.shutdownPromise;
+  }
+
+  async close(): Promise<void> {
+    const httpServer = this.httpServerInstance;
+    this.httpServerInstance = undefined;
+    await this.shutdownNegotiation();
+    if (httpServer?.listening) {
       await new Promise<void>((resolve, reject) => {
-        server.close((error) => (error ? reject(error) : resolve()));
+        httpServer.close((error) => (error ? reject(error) : resolve()));
         // Do not let idle keep-alive sockets stall shutdown.
-        server.closeAllConnections?.();
+        httpServer.closeAllConnections?.();
       });
     }
-    await this.store.close?.();
   }
 
   /** Stores the result; the actual HTTP response is sent by end(). */

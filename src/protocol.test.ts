@@ -594,3 +594,58 @@ test("runs on Express, behind express.json(), via requestHandler()", async () =>
     await server.close();
   }
 });
+
+test("attach() wires httpServer, close and events for external (Express-style) servers", async () => {
+  let storeClosed = 0;
+  const store = new MemoryRequestStore();
+  (store as any).close = async () => { storeClosed += 1; };
+  const server = new NegotiationServer({ requestTimeoutMs: 5_000, store });
+  server.handle("/test", async () => ({ ok: true }));
+
+  assert.equal(server.httpServer, undefined); // nothing attached yet
+  const http = createHttpServer(server.requestHandler());
+  server.attach(http);
+  assert.equal(server.httpServer, http); // now inspectable / initialised
+
+  const port = await findFreePort();
+  await new Promise<void>((resolve) => http.listen(port, "127.0.0.1", resolve));
+  const client = new NegotiationClient();
+  assert.deepEqual(await client.call({ url: `http://127.0.0.1:${port}/test`, data: {} }), { ok: true });
+
+  await server.close();
+  assert.equal(http.listening, false);       // close() closed the attached server
+  assert.equal(server.httpServer, undefined); // and detached itself
+  assert.equal(storeClosed, 1);
+  await server.close();                       // idempotent
+  assert.equal(storeClosed, 1);
+});
+
+test("closing an attached HTTP server externally cleans up pending jobs and the store", async () => {
+  let storeClosed = false;
+  const store = new MemoryRequestStore();
+  (store as any).close = async () => { storeClosed = true; };
+  const server = new NegotiationServer({ requestTimeoutMs: 60_000, jobTimeoutMs: 60_000, store });
+  server.handle("/test", async () => {
+    const value = await server.ask.getValue(); // suspends, awaiting a resume that never comes
+    return { value };
+  });
+  const http = createHttpServer(server.requestHandler());
+  server.attach(http);
+  const port = await findFreePort();
+  await new Promise<void>((resolve) => http.listen(port, "127.0.0.1", resolve));
+
+  // Start a job manually; the negotiation response leaves it pending.
+  const initial = await postJson(`http://127.0.0.1:${port}`, "/test", { data: {} });
+  assert.equal(initial.body.done, false);
+  assert.equal(server.getJobCount(), 1);
+
+  // Shut the HTTP server down WITHOUT calling server.close():
+  // the "close" event alone must clean up jobs and the store.
+  await new Promise<void>((resolve, reject) => http.close((e) => (e ? reject(e) : resolve())));
+  for (let i = 0; i < 50 && (server.getJobCount() !== 0 || !storeClosed); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(server.getJobCount(), 0);
+  assert.equal(storeClosed, true);
+  await server.close();
+});

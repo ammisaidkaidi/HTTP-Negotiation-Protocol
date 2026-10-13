@@ -52,9 +52,11 @@ app.listen(3000);
 
 Rules:
 
-- **You own the HTTP server.** On shutdown, close your framework server and
-  also `await server.close()` — it rejects pending jobs and closes the store,
-  but never touches your server.
+- **Lifecycle:** with plain `requestHandler()` you own the HTTP server and
+  `server.close()` only cleans up jobs/store. Prefer `server.attach(http)`
+  (as in `examples/express.ts`): `server.httpServer` is then set, HTTP
+  `error`/`close` events are wired (an external close cleans up jobs/store
+  exactly once), and a single `await server.close()` closes everything.
 - **Mount at the root** (route matching uses the full request path,
   `originalUrl` included). Mount other middleware/routes before or after as
   usual; anything that is not a negotiation route, the resume endpoint, or a
