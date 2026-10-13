@@ -64,6 +64,31 @@ Proxy rules:
   `server.requireMany(...)` for parallel calls with `fallback`) remains fully supported
   and is still the way to pass fallbacks, explicit types, or low-level action results.
 
+## Batch syntax (v1.4.0, `server.asks()`)
+
+Chain several client services without awaiting them — they all execute in
+**one negotiation round, in parallel** when you call `done()`:
+
+```ts
+const asks = server.asks();
+asks.selectDeliverySlot({
+  orderId: input.orderId,
+  slots,
+  fragileHandling: preferences.fragileHandling,
+}).getNames();              // no arguments = `data` is undefined
+
+const results = await asks.done();
+results[0];                 // first result, in call order
+results.selectDeliverySlot; // same result, by service name
+```
+
+- Destructure if you prefer: `const [slot, names] = await asks.done();`
+- Dotted names chain too: `asks.location.getArea()` → `"location.getArea"`
+  (results are attached under both `results["location.getArea"]` and `results.getArea`).
+- Per-call fallback: `asks.getCurrentLocation({}, { fallback: null })`.
+- The builder is single-use (`done()` throws if called twice) and is also
+  awaitable itself: `const results = await server.asks().getNames();`
+
 ## Minimal API (classic syntax)
 
 ```ts

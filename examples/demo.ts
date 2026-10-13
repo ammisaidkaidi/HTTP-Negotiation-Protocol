@@ -88,20 +88,16 @@ server.handle("/delivery/estimate", async (request) => {
     throw new Error("orderId and deliveryArea are required");
   }
 
-  // Both client services execute in parallel in one negotiation round.
-  // The fallback property keeps a non-critical service failure out of the main flow.
-  const [locationValue, preferencesValue] = await server.requireMany([
-    {
-      name: "getCurrentLocation",
-      data: {},
-      fallback: null,
-    },
-    {
-      name: "getDeliveryPreferences",
-      data: {},
+  // asks() builder: chained client services execute in parallel in ONE
+  // negotiation round on done(). The fallback keeps a non-critical service
+  // failure out of the main flow.
+  const asks = server.asks();
+  asks
+    .getCurrentLocation({}, { fallback: null })
+    .getDeliveryPreferences({}, {
       fallback: { preferredPeriod: "afternoon", fragileHandling: false } satisfies Preferences,
-    },
-  ]);
+    });
+  const [locationValue, preferencesValue] = await asks.done();
 
   const location = locationValue as Location | null;
   const preferences = preferencesValue as Preferences;

@@ -336,3 +336,73 @@ test("magic proxy surfaces unknown and ambiguous action errors", async () => {
     await assert.rejects(client.call({ url: `${baseUrl}/ambiguous`, data: {} }), /Ambiguous server action/);
   });
 });
+
+test("v1.4 asks() builder batches chained services into one round via done()", async () => {
+  const server = new NegotiationServer({ requestTimeoutMs: 5_000 });
+  server.handle("/test", async (request) => {
+    const input = request.data as { orderId: string };
+    // Exactly the proposed syntax (plus named/index access on the result):
+    const asks = server.asks();
+    asks.selectDeliverySlot({
+      orderId: input.orderId,
+      slots: ["slot_1", "slot_2"],
+      fragileHandling: true,
+    }).getNames();
+    const results = await asks.done();
+    return {
+      byIndex: [results[0], results[1]],
+      byName: results.selectDeliverySlot,
+      names: results.getNames,
+    };
+  });
+  server.handle("/fallbacks", async () => {
+    const asks = server.asks();
+    asks.location.getArea().notRegistered({}, { fallback: "fallback-used" }).getNames();
+    const results = await asks.done();
+    const awaited = await server.asks().getNames(); // builder is also awaitable
+    return {
+      area: results.getArea,
+      areaByFullName: results["location.getArea"],
+      missing: results[1],
+      awaited,
+    };
+  });
+  const client = new NegotiationClient();
+  client.use({
+    selectDeliverySlot: async ({ slots }: any) => ({ slotId: slots[1] }),
+    getNames: async () => ["a", "b"],
+    "location.getArea": async () => "Ghardaia-Centre",
+  });
+  await withServer(server, async (baseUrl) => {
+    assert.deepEqual(await client.call({ url: `${baseUrl}/test`, data: { orderId: "ORD-1" } }), {
+      byIndex: [{ slotId: "slot_2" }, ["a", "b"]],
+      byName: { slotId: "slot_2" },
+      names: ["a", "b"],
+    });
+    assert.deepEqual(await client.call({ url: `${baseUrl}/fallbacks`, data: {} }), {
+      area: "Ghardaia-Centre",
+      areaByFullName: "Ghardaia-Centre",
+      missing: "fallback-used",
+      awaited: [["a", "b"]],
+    });
+  });
+});
+
+test("asks() builder is single-use", async () => {
+  const server = new NegotiationServer({ requestTimeoutMs: 5_000 });
+  server.handle("/test", async () => {
+    const asks = server.asks();
+    asks.getNames();
+    await asks.done();
+    await asks.done(); // second call must throw
+    return { unreachable: true };
+  });
+  const client = new NegotiationClient();
+  client.use({ getNames: async () => [] });
+  await withServer(server, async (baseUrl) => {
+    await assert.rejects(
+      client.call({ url: `${baseUrl}/test`, data: {} }),
+      /asks\.done\(\) can only be called once/,
+    );
+  });
+});

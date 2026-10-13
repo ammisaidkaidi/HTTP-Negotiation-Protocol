@@ -419,6 +419,29 @@ export type ClientServiceProxy = any;
 /** See {@link ClientServiceProxy}: intentionally dynamic (`any`). */
 export type ServerActionProxy = any;
 
+/**
+ * Batch builder returned by `server.asks()` (v1.4 syntax). Chain service
+ * calls without awaiting them, then execute them all in ONE negotiation
+ * round (in parallel, like `requireMany`) with `done()`:
+ *
+ *   const asks = server.asks();
+ *   asks.selectDeliverySlot({ orderId, slots }).getNames();
+ *   const results = await asks.done();
+ *   results[0];                   // first result, in call order
+ *   results.selectDeliverySlot;   // same result, by service name
+ *
+ * Per-call options: `asks.getLocation(data, { fallback: null })`.
+ * Intentionally dynamic (`any`), like the other proxy syntaxes.
+ */
+export type AsksBuilder = any;
+
+interface AskEntry {
+  name: string;
+  data?: unknown;
+  fallback?: unknown;
+  hasFallback: boolean;
+}
+
 export class NegotiationServer {
   private readonly storage = new AsyncLocalStorage<JobContext>();
   private readonly routes = new Map<string, RouteHandler>();
@@ -646,6 +669,78 @@ export class NegotiationServer {
   /** Explicitly named alternative when a batch of client services is required. */
   async requireMany<T = unknown>(actions: ClientServiceRequest[]): Promise<T[]> {
     return await this.require<T>(actions);
+  }
+
+  /**
+   * Batch builder for parallel client services: chain calls now, run them
+   * all in a single negotiation round with `await asks.done()`.
+   * The builder is single-use; create a new one for the next round.
+   */
+  asks(): AsksBuilder {
+    const entries: AskEntry[] = [];
+    let executed = false;
+
+    const done = async (): Promise<any> => {
+      if (executed) {
+        throw new Error("asks.done() can only be called once; create a new builder with server.asks()");
+      }
+      executed = true;
+      if (entries.length === 0) return [];
+      const descriptors: ClientServiceRequest[] = entries.map((entry) => {
+        const descriptor: ClientServiceRequest = { name: entry.name, data: entry.data };
+        if (entry.hasFallback) descriptor.fallback = entry.fallback;
+        return descriptor;
+      });
+      const values = await this.requireMany<unknown>(descriptors);
+      // Array in call order, with each result also attached by service name
+      // (leaf name and full dotted name) for named access.
+      const results: any = [...values];
+      entries.forEach((entry, index) => {
+        results[entry.name] = values[index];
+        const leaf = entry.name.split(".").pop();
+        if (leaf && leaf !== entry.name) results[leaf] = values[index];
+      });
+      return results;
+    };
+
+    const enqueue = (path: string, data?: unknown, options?: { fallback?: unknown }): AsksBuilder => {
+      if (executed) {
+        throw new Error("Cannot add asks after done(); create a new builder with server.asks()");
+      }
+      if (!path) throw new TypeError("asks must be called on a service name, e.g. asks.getName()");
+      entries.push({
+        name: path,
+        data,
+        hasFallback: options != null && Object.prototype.hasOwnProperty.call(options, "fallback"),
+        ...(options != null && Object.prototype.hasOwnProperty.call(options, "fallback")
+          ? { fallback: options.fallback }
+          : {}),
+      });
+      return root;
+    };
+
+    const createNode = (segments: string[]): AsksBuilder => {
+      const callable = (data?: unknown, options?: { fallback?: unknown }) =>
+        enqueue(segments.join("."), data, options);
+      return new Proxy(callable, {
+        get: (target, prop) => {
+          if (segments.length === 0 && prop === "done") return () => done();
+          if (segments.length === 0 && prop === "then") {
+            // The builder itself is awaitable: `await asks` === `await asks.done()`.
+            return (resolve: unknown, reject: unknown) =>
+              done().then(resolve as never, reject as never);
+          }
+          if (typeof prop !== "string") return Reflect.get(target, prop);
+          if (prop in target) return Reflect.get(target, prop);
+          return createNode([...segments, prop]);
+        },
+        apply: (_target, _thisArg, args) =>
+          enqueue(segments.join("."), args[0] as unknown, args[1] as { fallback?: unknown } | undefined),
+      });
+    };
+
+    const root: AsksBuilder = createNode([]);
+    return root;
   }
 
   private async requestClientActions(inputActions: ClientAction[]): Promise<ActionResult[]> {

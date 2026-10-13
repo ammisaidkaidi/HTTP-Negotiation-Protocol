@@ -1,6 +1,6 @@
 {
   "name": "http-negotiation-protocol",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "A minimal TypeScript HTTP request-negotiation protocol with client services and external callbacks.",
   "type": "module",
   "license": "MIT",

@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-10-13
+
+### Added
+
+- `server.asks()` batch builder: chain client-service calls
+  (`asks.selectDeliverySlot({...}).getNames()`) and execute them all in one
+  parallel negotiation round with `await asks.done()`. Results are returned
+  as an array in call order, with each result also attached by service name.
+  Supports per-call `{ fallback }`, dotted service names, and awaiting the
+  builder directly.
+
 ## [1.3.0] - 2026-10-13
 
 ### Added
