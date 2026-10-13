@@ -406,3 +406,78 @@ test("asks() builder is single-use", async () => {
     );
   });
 });
+
+test("v1.5 runs() builder batches chained server actions via done()", async () => {
+  const server = new NegotiationServer({ requestTimeoutMs: 5_000 });
+  let active = 0;
+  let maxActive = 0;
+  const track = async (fn: () => unknown) => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    active -= 1;
+    return fn();
+  };
+  server.use({
+    "math.add": async ({ a, b }: any) => track(() => Number(a) + Number(b)),
+    "math.double": async ({ value }: any) => track(() => Number(value) * 2),
+    "delivery.getAvailableSlots": async () => track(() => ["slot_1"]),
+    "explode": async () => { throw new Error("boom"); },
+  });
+  server.handle("/test", async () => {
+    const runs = server.runs();
+    runs.math.add({ a: 2, b: 3 }).mathDouble({ value: 21 }).getAvailableSlots({});
+    const results = await runs.done();
+    const withFallback = await server.runs().explode({}, { fallback: "recovered" }).done();
+    return {
+      byIndex: [results[0], results[1], results[2]],
+      byLeaf: results.add,
+      byFullName: results["math.add"],
+      slotsByLeaf: results.getAvailableSlots,
+      ranInParallel: maxActive > 1,
+      fallbackResult: withFallback[0],
+    };
+  });
+  server.handle("/fails", async () => {
+    await server.runs().explode().done();
+    return { unreachable: true };
+  });
+  server.handle("/twice", async () => {
+    const runs = server.runs();
+    runs.math.add({ a: 1, b: 1 });
+    await runs.done();
+    await runs.done(); // second call must throw
+    return { unreachable: true };
+  });
+  const client = new NegotiationClient();
+  await withServer(server, async (baseUrl) => {
+    assert.deepEqual(await client.call({ url: `${baseUrl}/test`, data: {} }), {
+      byIndex: [5, 42, ["slot_1"]],
+      byLeaf: 5,
+      byFullName: 5,
+      slotsByLeaf: ["slot_1"],
+      ranInParallel: true,
+      fallbackResult: "recovered",
+    });
+    await assert.rejects(client.call({ url: `${baseUrl}/fails`, data: {} }), /boom/);
+    await assert.rejects(
+      client.call({ url: `${baseUrl}/twice`, data: {} }),
+      /runs\.done\(\) can only be called once/,
+    );
+  });
+});
+
+test("runs() builder surfaces unknown and ambiguous actions on done()", async () => {
+  const server = new NegotiationServer({ requestTimeoutMs: 5_000 });
+  server.use({
+    "a.get": async () => 1,
+    "b.get": async () => 2,
+  });
+  server.handle("/unknown", async () => server.runs().nope().done());
+  server.handle("/ambiguous", async () => server.runs().get().done());
+  const client = new NegotiationClient();
+  await withServer(server, async (baseUrl) => {
+    await assert.rejects(client.call({ url: `${baseUrl}/unknown`, data: {} }), /Unknown server action/);
+    await assert.rejects(client.call({ url: `${baseUrl}/ambiguous`, data: {} }), /Ambiguous server action/);
+  });
+});

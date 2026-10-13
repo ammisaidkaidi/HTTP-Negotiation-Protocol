@@ -442,6 +442,30 @@ interface AskEntry {
   hasFallback: boolean;
 }
 
+/**
+ * Batch builder returned by `server.runs()` (v1.5 syntax). The mirror of
+ * `server.asks()` for server-side actions: chain calls without awaiting,
+ * then execute them all (in parallel) with `done()`:
+ *
+ *   const runs = server.runs();
+ *   runs.math.add({ a: 2, b: 3 }).delivery.getAvailableSlots({ period: "am" });
+ *   const results = await runs.done();
+ *   results[0];          // first result, in call order
+ *   results.add;         // same result, by leaf action name
+ *   results["math.add"]; // same result, by full dotted name
+ *
+ * Per-call options: `runs.math.add(data, { fallback: 0 })`.
+ * Intentionally dynamic (`any`), like the other proxy syntaxes.
+ */
+export type RunsBuilder = any;
+
+interface RunEntry {
+  name: string;
+  data?: unknown;
+  fallback?: unknown;
+  hasFallback: boolean;
+}
+
 export class NegotiationServer {
   private readonly storage = new AsyncLocalStorage<JobContext>();
   private readonly routes = new Map<string, RouteHandler>();
@@ -740,6 +764,84 @@ export class NegotiationServer {
     };
 
     const root: AsksBuilder = createNode([]);
+    return root;
+  }
+
+  /**
+   * Batch builder for server-side actions: chain calls now, execute them
+   * all in parallel with `await runs.done()`. Unlike `asks()`, this costs
+   * no network round — actions are local — but it is handy when several
+   * independent actions should be declared together and read as one result.
+   * The builder is single-use; create a new one for the next batch.
+   */
+  runs(): RunsBuilder {
+    const entries: RunEntry[] = [];
+    let executed = false;
+
+    const done = async (): Promise<any> => {
+      if (executed) {
+        throw new Error("runs.done() can only be called once; create a new builder with server.runs()");
+      }
+      executed = true;
+      if (entries.length === 0) return [];
+      const values = await Promise.all(entries.map(async (entry) => {
+        try {
+          return await this.call(this.resolveServerActionName(entry.name), entry.data);
+        } catch (error) {
+          if (entry.hasFallback) return entry.fallback;
+          throw error;
+        }
+      }));
+      // Array in call order, with each result also attached by action name
+      // (leaf name and full dotted name) for named access.
+      const results: any = [...values];
+      entries.forEach((entry, index) => {
+        results[entry.name] = values[index];
+        const resolved = this.resolveServerActionName(entry.name);
+        if (resolved !== entry.name) results[resolved] = values[index];
+        const leaf = resolved.split(".").pop();
+        if (leaf && leaf !== resolved) results[leaf] = values[index];
+      });
+      return results;
+    };
+
+    const enqueue = (path: string, data?: unknown, options?: { fallback?: unknown }): RunsBuilder => {
+      if (executed) {
+        throw new Error("Cannot add runs after done(); create a new builder with server.runs()");
+      }
+      if (!path) throw new TypeError("runs must be called on an action name, e.g. runs.math.add()");
+      entries.push({
+        name: path,
+        data,
+        hasFallback: options != null && Object.prototype.hasOwnProperty.call(options, "fallback"),
+        ...(options != null && Object.prototype.hasOwnProperty.call(options, "fallback")
+          ? { fallback: options.fallback }
+          : {}),
+      });
+      return root;
+    };
+
+    const createNode = (segments: string[]): RunsBuilder => {
+      const callable = (data?: unknown, options?: { fallback?: unknown }) =>
+        enqueue(segments.join("."), data, options);
+      return new Proxy(callable, {
+        get: (target, prop) => {
+          if (segments.length === 0 && prop === "done") return () => done();
+          if (segments.length === 0 && prop === "then") {
+            // The builder itself is awaitable: `await runs` === `await runs.done()`.
+            return (resolve: unknown, reject: unknown) =>
+              done().then(resolve as never, reject as never);
+          }
+          if (typeof prop !== "string") return Reflect.get(target, prop);
+          if (prop in target) return Reflect.get(target, prop);
+          return createNode([...segments, prop]);
+        },
+        apply: (_target, _thisArg, args) =>
+          enqueue(segments.join("."), args[0] as unknown, args[1] as { fallback?: unknown } | undefined),
+      });
+    };
+
+    const root: RunsBuilder = createNode([]);
     return root;
   }
 

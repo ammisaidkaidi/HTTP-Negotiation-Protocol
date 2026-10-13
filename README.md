@@ -89,6 +89,29 @@ results.selectDeliverySlot; // same result, by service name
 - The builder is single-use (`done()` throws if called twice) and is also
   awaitable itself: `const results = await server.asks().getNames();`
 
+### Same builder for server actions: `server.runs()` (v1.5.0)
+
+Mirror of `asks()` for server-side actions. Actions are local (no network
+round), but the builder is handy when several independent actions belong
+together. They execute **in parallel** on `done()`:
+
+```ts
+const runs = server.runs();
+runs.math.add({ a: 2, b: 3 }).delivery.getAvailableSlots({ period: "morning" });
+
+const results = await runs.done();
+results[0];          // 5, in call order
+results.add;         // 5, by leaf action name
+results["math.add"]; // 5, by full dotted name
+```
+
+- Name resolution matches `server.run.*`: nested (`runs.math.add()`), bare
+  leaf (`runs.getAvailableSlots()`), or normalised (`runs.mathAdd()`).
+- Per-call fallback: `runs.explode(data, { fallback: "recovered" })`; without
+  a fallback, the first failure rejects `done()`.
+- Single-use builder, and awaitable directly:
+  `const results = await server.runs().math.add({ a: 1, b: 2 });`
+
 ## Minimal API (classic syntax)
 
 ```ts

@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-10-13
+
+### Added
+
+- `server.runs()` batch builder for server-side actions: chain calls
+  (`runs.math.add({...}).delivery.getAvailableSlots({...})`) and execute them
+  all in parallel with `await runs.done()`. Results are returned as an array
+  in call order, with each result also attached by leaf and full dotted
+  action name. Supports per-call `{ fallback }`, nested/bare-leaf/normalised
+  action names, and awaiting the builder directly.
+
 ## [1.4.0] - 2026-10-13
 
 ### Added
