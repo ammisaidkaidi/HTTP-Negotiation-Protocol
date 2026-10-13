@@ -1,8 +1,11 @@
 import {
+  act,
+  createClient,
+  createServer,
+  defineContract,
   MemoryRequestStore,
-  NegotiationClient,
-  NegotiationServer,
   PostgresRequestStore,
+  svc,
   type ClientPlugin,
   type HttpPluginRequest,
   type HttpPluginResponse,
@@ -35,13 +38,49 @@ interface CarrierQuote {
   etaMinutes: number;
 }
 
-const server = new NegotiationServer({
+// ---------------------------------------------------------------------------
+// Contract-first syntax (v1.6): services and actions are defined once, and
+// both sides derive autocomplete + argument/return types from this object.
+// `svc<Result, Data>()` declares a client service, `act<Result, Data>()`
+// declares a server action; omit Data for no-argument calls.
+// ---------------------------------------------------------------------------
+const contract = defineContract({
+  client: {
+    getCurrentLocation: svc<Location>(),
+    getDeliveryPreferences: svc<Preferences>(),
+    selectDeliverySlot: svc<
+      { slotId: string },
+      { orderId: string; slots: Slot[]; fragileHandling: boolean }
+    >(),
+  },
+  server: {
+    "delivery.getAvailableSlots": act<
+      Slot[],
+      { area: string; period: Preferences["preferredPeriod"] }
+    >(),
+    // server.callback() injects callbackUrl/jobId/callbackID into the data
+    // before this action runs, hence callbackUrl in the Data type.
+    "carrier.requestQuote": act<
+      { accepted: boolean },
+      {
+        orderId: string;
+        area: string;
+        slotId: string;
+        fragileHandling: boolean;
+        callbackUrl: string;
+      }
+    >(),
+  },
+});
+
+const server = createServer(contract, {
   publicBaseUrl,
   store,
   requestTimeoutMs: 120_000,
 });
 
-server.use({
+// implement(): argument and return types are checked against the contract.
+server.implement({
   "delivery.getAvailableSlots": async ({ period }) => {
     const slots: Slot[] = period === "morning"
       ? [
@@ -61,7 +100,7 @@ server.use({
   "carrier.requestQuote": async ({ orderId, area, slotId, callbackUrl }) => {
     console.log("[Server action] requesting quote:", { orderId, area, slotId });
     setTimeout(() => {
-      void fetch(String(callbackUrl), {
+      void fetch(callbackUrl, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -103,18 +142,19 @@ server.handle("/delivery/estimate", async (request) => {
   const preferences = preferencesValue as Preferences;
   const area = location?.area ?? input.deliveryArea;
 
-  // A server-side action is called with normal await: no callback IDs involved.
+  // Typed server action: argument and Slot[] result come from the contract,
+  // so no cast is needed (compare the pre-contract `as Slot[]`).
   const slots = await server.run.delivery.getAvailableSlots({
     area,
     period: preferences.preferredPeriod,
-  }) as Slot[];
+  });
 
-  // One service call; Server creates and tracks the callback ID internally.
+  // Typed client service: same here — { slotId: string } is inferred.
   const selected = await server.ask.selectDeliverySlot({
     orderId: input.orderId,
     slots,
     fragileHandling: preferences.fragileHandling,
-  }) as { slotId: string };
+  });
 
   const selectedSlot = slots.find((slot) => slot.id === selected.slotId);
   if (!selectedSlot) throw new Error("The client selected an invalid delivery slot");
@@ -146,7 +186,7 @@ server.handle("/delivery/estimate", async (request) => {
 });
 
 async function main(): Promise<void> {
-  const client = new NegotiationClient();
+  const client = createClient(contract);
   const plugin: ClientPlugin = {
     onRequest: async (request: HttpPluginRequest) => {
       console.log(`[Plugin] ${request.phase.toUpperCase()} ${request.url}`);
@@ -157,8 +197,9 @@ async function main(): Promise<void> {
     },
   };
 
-  // `.use(plugin).use(services)` keeps the public setup simple.
-  client.use(plugin).use({
+  // Plugins still use .use(); services now use contract-checked .provide().
+  client.use(plugin);
+  client.provide({
     getCurrentLocation: async () => {
       // Simulate a user denying GPS permission; the declared fallback is used.
       const error = new Error("Location permission denied") as Error & { code: string };
@@ -169,7 +210,7 @@ async function main(): Promise<void> {
       preferredPeriod: "afternoon",
       fragileHandling: true,
     }),
-    selectDeliverySlot: async ({ slots }: { slots: Slot[] }) => ({
+    selectDeliverySlot: async ({ slots }) => ({
       slotId: slots.find((slot) => slot.id === "slot_16_18")?.id ?? "",
     }),
   });
