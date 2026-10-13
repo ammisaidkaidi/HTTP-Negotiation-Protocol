@@ -96,6 +96,117 @@ export type ClientServices = Record<string, ClientService>;
 export type ServerAction = (data: any, request?: ServerRequest) => unknown | Promise<unknown>;
 export type RouteHandler = (request: ServerRequest) => unknown | Promise<unknown>;
 
+// ---------------------------------------------------------------------------
+// Contract-first typed API (v1.6)
+// ---------------------------------------------------------------------------
+
+/** Phantom-typed client-service descriptor created with `svc()`. */
+export interface ServiceSpec<TData = void, TResult = unknown> {
+  readonly kind: "client-service";
+  readonly __data?: TData;
+  readonly __result?: TResult;
+}
+
+/** Phantom-typed server-action descriptor created with `act()`. */
+export interface ActionSpec<TData = void, TResult = unknown> {
+  readonly kind: "server-action";
+  readonly __data?: TData;
+  readonly __result?: TResult;
+}
+
+/** Declare a client service in a contract: `svc<Result, Data>()` (Data defaults to no-argument). */
+export function svc<TResult = unknown, TData = void>(): ServiceSpec<TData, TResult> {
+  return Object.freeze({ kind: "client-service" }) as unknown as ServiceSpec<TData, TResult>;
+}
+
+/** Declare a server action in a contract: `act<Result, Data>()` (Data defaults to no-argument). */
+export function act<TResult = unknown, TData = void>(): ActionSpec<TData, TResult> {
+  return Object.freeze({ kind: "server-action" }) as unknown as ActionSpec<TData, TResult>;
+}
+
+/** Long-form aliases for {@link svc} / {@link act}. */
+export const defineService = svc;
+export const defineAction = act;
+
+export interface ContractDefinition {
+  client?: Record<string, ServiceSpec<any, any>>;
+  server?: Record<string, ActionSpec<any, any>>;
+}
+
+export interface EmptyContract {
+  client: Record<never, never>;
+  server: Record<never, never>;
+}
+
+/**
+ * Define the shared contract once; both sides derive their types from it.
+ *
+ *   const contract = defineContract({
+ *     client: { getName: svc<{ name: string }>() },
+ *     server: { "math.add": act<number, { a: number; b: number }>() },
+ *   });
+ *   const server = createServer(contract);
+ *   const client = createClient(contract);
+ */
+export function defineContract<C extends ContractDefinition>(contract: C): C {
+  return contract;
+}
+
+type UnionToIntersection<U> = (U extends unknown ? (value: U) => void : never) extends (value: infer I) => void
+  ? I
+  : never;
+
+type SpecCall<S> = S extends { readonly __result?: infer R; readonly __data?: infer D }
+  ? unknown extends D
+    ? (data?: unknown) => Promise<R>
+    : [D] extends [void]
+      ? () => Promise<R>
+      : (data: D) => Promise<R>
+  : never;
+
+type NestedProxy<K extends string, F> = K extends `${infer Head}.${infer Rest}`
+  ? { [P in Head]: NestedProxy<Rest, F> }
+  : { [P in K]: F };
+
+type ClientMap<C> = C extends { client: infer M } ? M : Record<never, never>;
+type ServerMap<C> = C extends { server: infer M } ? M : Record<never, never>;
+
+/** Fully-typed `server.ask` proxy derived from a contract's client map. */
+export type AskFor<C> = [keyof ClientMap<C>] extends [never]
+  ? ClientServiceProxy
+  : UnionToIntersection<
+      { [K in keyof ClientMap<C> & string]: NestedProxy<K, SpecCall<ClientMap<C>[K]>> }[keyof ClientMap<C> & string]
+    >;
+
+/** Fully-typed `server.run` proxy derived from a contract's server map. */
+export type RunFor<C> = [keyof ServerMap<C>] extends [never]
+  ? ServerActionProxy
+  : UnionToIntersection<
+      { [K in keyof ServerMap<C> & string]: NestedProxy<K, SpecCall<ServerMap<C>[K]>> }[keyof ServerMap<C> & string]
+    >;
+
+/** Typed implementations for `client.provide(...)` (subset registration allowed). */
+export type ClientServiceImplementations<C> = {
+  [K in keyof ClientMap<C>]: ClientMap<C>[K] extends { readonly __result?: infer R; readonly __data?: infer D }
+    ? (data: D) => R | Promise<R>
+    : never;
+};
+
+type ImplementFor<C> = [keyof ServerMap<C>] extends [never]
+  ? Record<string, ServerAction>
+  : Partial<ServerActionImplementations<C>>;
+
+type ProvideFor<C> = [keyof ClientMap<C>] extends [never]
+  ? ClientServices
+  : Partial<ClientServiceImplementations<C>>;
+
+/** Typed implementations for `server.implement(...)` (subset registration allowed). */
+export type ServerActionImplementations<C> = {
+  [K in keyof ServerMap<C>]: ServerMap<C>[K] extends { readonly __result?: infer R; readonly __data?: infer D }
+    ? (data: D, request?: ServerRequest) => R | Promise<R>
+    : never;
+};
+
 export interface StoredRequestResponse {
   jobId: string;
   request: ServerRequest;
@@ -214,6 +325,8 @@ export interface NegotiationServerOptions {
   jobTimeoutMs?: number;
   /** Structured error hook (replaces ad-hoc console logging). */
   onError?: (error: Error, info: { jobId?: string; path?: string; phase: string }) => void;
+  /** Optional contract created with `defineContract()`; used for typed proxies. */
+  contract?: ContractDefinition;
 }
 
 interface Deferred<T> {
@@ -466,7 +579,7 @@ interface RunEntry {
   hasFallback: boolean;
 }
 
-export class NegotiationServer {
+export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   private readonly storage = new AsyncLocalStorage<JobContext>();
   private readonly routes = new Map<string, RouteHandler>();
   private readonly actions = new Map<string, ServerAction>();
@@ -481,8 +594,10 @@ export class NegotiationServer {
   private readonly maxJobs: number;
   private readonly jobTimeoutMs: number;
   private readonly onError: NegotiationServerOptions["onError"];
+  readonly contract: C | undefined;
 
-  constructor(options: NegotiationServerOptions = {}) {
+  constructor(options: (NegotiationServerOptions & { contract?: C }) = {}) {
+    this.contract = options.contract;
     this.store = options.store ?? new MemoryRequestStore();
     this.publicBaseUrl = options.publicBaseUrl;
     this.defaultCallbackPath = options.callbackPath ?? "/__negotiation/callback";
@@ -539,20 +654,44 @@ export class NegotiationServer {
     return this;
   }
 
-  /** Magic proxy for client services: `await server.ask.getName(data)`. */
-  get ask(): ClientServiceProxy {
+  /**
+   * Magic proxy for client services: `await server.ask.getName(data)`.
+   * With a contract (see `createServer`) this is fully typed/autocompleted.
+   */
+  get ask(): AskFor<C> {
     return this.createPathProxy([], async (path, data) => {
       if (!path) throw new TypeError("server.ask must be called on a service name, e.g. server.ask.getName()");
+      if (this.contract?.client && !(path in this.contract.client)) {
+        throw new TypeError(`Client service '${path}' is not defined in the contract`);
+      }
       return this.require(path, data);
-    }) as ClientServiceProxy;
+    }) as AskFor<C>;
   }
 
-  /** Magic proxy for server actions: `await server.run.math.add(data)`. */
-  get run(): ServerActionProxy {
+  /**
+   * Magic proxy for server actions: `await server.run.math.add(data)`.
+   * With a contract (see `createServer`) this is fully typed/autocompleted.
+   */
+  get run(): RunFor<C> {
     return this.createPathProxy([], async (path, data) => {
       if (!path) throw new TypeError("server.run must be called on an action name, e.g. server.run.math.add()");
       return await this.call(this.resolveServerActionName(path), data);
-    }) as ServerActionProxy;
+    }) as RunFor<C>;
+  }
+
+  /**
+   * Register server actions with contract-checked argument/return types.
+   * Subsets are allowed; call it more than once to register the rest.
+   */
+  implement(actions: ImplementFor<C>): this {
+    if (this.contract?.server) {
+      for (const name of Object.keys(actions)) {
+        if (!(name in this.contract.server)) {
+          throw new TypeError(`Server action '${name}' is not defined in the contract`);
+        }
+      }
+    }
+    return this.use(actions as Record<string, ServerAction>);
   }
 
   private resolveServerActionName(path: string): string {
@@ -1286,16 +1425,26 @@ export class NegotiationServer {
   }
 }
 
+/** Create a contract-typed server: `const server = createServer(contract, options?)`. */
+export function createServer<C extends ContractDefinition>(
+  contract: C,
+  options: NegotiationServerOptions = {},
+): NegotiationServer<C> {
+  return new NegotiationServer<C>({ ...options, contract });
+}
+
 export interface NegotiationClientOptions {
   serviceTimeoutMs?: number;
   requestTimeoutMs?: number;
+  /** Optional contract created with `defineContract()`; used for typed `provide()`. */
+  contract?: ContractDefinition;
   /** Maximum negotiation rounds per logical call; guards against server loops. Default 100. */
   maxRounds?: number;
   /** Maximum accepted response body size in bytes. Default 1_000_000. */
   maxResponseBytes?: number;
 }
 
-export class NegotiationClient {
+export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
   private readonly plugins: ClientPlugin[] = [];
   private readonly services = new Map<string, ClientService>();
   private readonly serviceTimeoutMs: number;
@@ -1303,7 +1452,10 @@ export class NegotiationClient {
   private readonly maxRounds: number;
   private readonly maxResponseBytes: number;
 
-  constructor(options: NegotiationClientOptions = {}) {
+  readonly contract: C | undefined;
+
+  constructor(options: (NegotiationClientOptions & { contract?: C }) = {}) {
+    this.contract = options.contract;
     this.serviceTimeoutMs = options.serviceTimeoutMs ?? 60_000;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 120_000;
     this.maxRounds = options.maxRounds ?? 100;
@@ -1327,6 +1479,21 @@ export class NegotiationClient {
       }
     }
     return this;
+  }
+
+  /**
+   * Register client services with contract-checked argument/return types.
+   * Subsets are allowed; call it more than once to register the rest.
+   */
+  provide(services: ProvideFor<C>): this {
+    if (this.contract?.client) {
+      for (const name of Object.keys(services)) {
+        if (!(name in this.contract.client)) {
+          throw new TypeError(`Client service '${name}' is not defined in the contract`);
+        }
+      }
+    }
+    return this.use(services as ClientServices);
   }
 
   async call(request: ClientCallRequest): Promise<unknown> {
@@ -1501,6 +1668,14 @@ export class NegotiationClient {
       throw converted;
     }
   }
+}
+
+/** Create a contract-typed client: `const client = createClient(contract, options?)`. */
+export function createClient<C extends ContractDefinition>(
+  contract: C,
+  options: NegotiationClientOptions = {},
+): NegotiationClient<C> {
+  return new NegotiationClient<C>({ ...options, contract });
 }
 
 export const Client = new NegotiationClient();

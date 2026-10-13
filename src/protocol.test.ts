@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
-import { createServer } from "node:net";
+import { createServer as createNetServer } from "node:net";
 import test from "node:test";
 import {
+  act,
+  createClient,
+  createServer,
+  defineContract,
   MemoryRequestStore,
   NegotiationClient,
   NegotiationServer,
+  svc,
 } from "./protocol.js";
 
 async function findFreePort(): Promise<number> {
-  const probe = createServer();
+  const probe = createNetServer();
   await new Promise<void>((resolve, reject) => {
     probe.once("error", reject);
     probe.listen(0, "127.0.0.1", resolve);
@@ -480,4 +485,59 @@ test("runs() builder surfaces unknown and ambiguous actions on done()", async ()
     await assert.rejects(client.call({ url: `${baseUrl}/unknown`, data: {} }), /Unknown server action/);
     await assert.rejects(client.call({ url: `${baseUrl}/ambiguous`, data: {} }), /Ambiguous server action/);
   });
+});
+
+test("v1.6 contract-first API types ask/run and checks provide/implement", async () => {
+  interface Slot { id: string }
+  const contract = defineContract({
+    client: {
+      getName: svc<{ name: string }>(),
+      selectSlot: svc<{ slotId: string }, { slots: Slot[] }>(),
+      "location.getArea": svc<string, { precise: boolean }>(),
+    },
+    server: {
+      "math.add": act<number, { a: number; b: number }>(),
+      "delivery.getAvailableSlots": act<Slot[]>(),
+    },
+  });
+
+  const server = createServer(contract, { requestTimeoutMs: 5_000 });
+  server.implement({
+    "math.add": async ({ a, b }) => a + b,
+    "delivery.getAvailableSlots": async () => [{ id: "slot_1" }, { id: "slot_2" }],
+  });
+  server.handle("/test", async () => {
+    // Every line below is type-checked against the contract (see typecheck):
+    const { name } = await server.ask.getName();
+    const area: string = await server.ask.location.getArea({ precise: false });
+    const slots: Slot[] = await server.run.delivery.getAvailableSlots();
+    const selected = await server.ask.selectSlot({ slots });
+    const sum: number = await server.run.math.add({ a: 2, b: 3 });
+    return { name, area, slotId: selected.slotId, sum, slotCount: slots.length };
+  });
+
+  const client = createClient(contract);
+  client.provide({
+    getName: async () => ({ name: "Alex" }),
+    selectSlot: async ({ slots }) => ({ slotId: slots[1]?.id ?? "" }),
+    "location.getArea": async ({ precise }) => (precise ? "Ghardaia-Centre (precise)" : "Ghardaia-Centre"),
+  });
+
+  const port = await findFreePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  await server.listen(port, "127.0.0.1");
+  try {
+    assert.deepEqual(await client.call({ url: `${baseUrl}/test`, data: {} }), {
+      name: "Alex",
+      area: "Ghardaia-Centre",
+      slotId: "slot_2",
+      sum: 5,
+      slotCount: 2,
+    });
+    // Contract violations are rejected at registration time:
+    assert.throws(() => server.implement({ nope: async () => 1 } as never), /not defined in the contract/);
+    assert.throws(() => client.provide({ nope: async () => 1 } as never), /not defined in the contract/);
+  } finally {
+    await server.close();
+  }
 });

@@ -30,6 +30,63 @@ DATABASE_URL="postgres://user:password@localhost:5432/mydb" npm start
 
 For external callbacks from another machine, set `PUBLIC_BASE_URL` to a publicly reachable HTTPS URL and secure the application or reverse proxy. The generated callback URL contains an unguessable token, but this is not a substitute for your provider's signature verification where available.
 
+## Contract-first typed syntax (v1.6.0) — recommended
+
+Define services/actions **once** in a contract; both sides derive
+autocomplete, argument types, and return types from it — no more `any`
+proxies:
+
+```ts
+import {
+  act, createClient, createServer, defineContract, svc,
+} from "http-negotiation-protocol";
+
+interface Slot { id: string }
+
+const contract = defineContract({
+  client: {
+    getName: svc<{ name: string }>(),                              // () -> { name }
+    selectSlot: svc<{ slotId: string }, { slots: Slot[] }>(),      // (data) -> { slotId }
+    "location.getArea": svc<string, { precise: boolean }>(),
+  },
+  server: {
+    "math.add": act<number, { a: number; b: number }>(),
+    "delivery.getAvailableSlots": act<Slot[]>(),
+  },
+});
+
+const server = createServer(contract);
+server.implement({                          // argument/return types checked
+  "math.add": async ({ a, b }) => a + b,
+  "delivery.getAvailableSlots": async () => [{ id: "slot_1" }],
+});
+
+server.handle("/example", async () => {
+  const { name } = await server.ask.getName();                     // typed, autocompleted
+  const area = await server.ask.location.getArea({ precise: false });
+  const sum = await server.run.math.add({ a: 2, b: 3 });           // missing `b` = compile error
+  return { name, area, sum };
+});
+
+const client = createClient(contract);
+client.provide({                            // implementations are checked too
+  getName: async () => ({ name: "Alex" }),
+  selectSlot: async ({ slots }) => ({ slotId: slots[0]?.id ?? "" }),
+  "location.getArea": async () => "Ghardaia-Centre",
+});
+```
+
+Notes:
+
+- `svc<Result, Data>()` / `act<Result, Data>()` are phantom-typed markers;
+  omit `Data` for no-argument services (`svc<{ name: string }>()`).
+- `server.implement(...)` and `client.provide(...)` accept **subsets** —
+  register the rest in a later call. Names outside the contract are
+  rejected at runtime, as are `server.ask.*` calls outside the contract.
+- Typed proxies expose full dotted paths (`server.ask.location.getArea()`);
+  the classic/untyped `NegotiationServer` / `NegotiationClient` (and
+  `server.use` / `client.use`) are unchanged.
+
 ## Shortest syntax (v1.3.0, magic proxies)
 
 No string service/action names inside routes, and `return` replaces `server.end()`:
