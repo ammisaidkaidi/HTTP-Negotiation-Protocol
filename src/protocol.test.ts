@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { createServer as createHttpServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
+import express from "express";
 import test from "node:test";
 import {
   act,
@@ -538,6 +540,57 @@ test("v1.6 contract-first API types ask/run and checks provide/implement", async
     assert.throws(() => server.implement({ nope: async () => 1 } as never), /not defined in the contract/);
     assert.throws(() => client.provide({ nope: async () => 1 } as never), /not defined in the contract/);
   } finally {
+    await server.close();
+  }
+});
+
+test("runs on plain node:http via requestHandler() without server.listen()", async () => {
+  const server = new NegotiationServer({ requestTimeoutMs: 5_000 });
+  server.handle("/test", async () => {
+    const value = await server.ask.getValue();
+    return { value };
+  });
+  const client = new NegotiationClient();
+  client.use({ getValue: async () => 7 });
+  const port = await findFreePort();
+  const http = createHttpServer(server.requestHandler());
+  await new Promise<void>((resolve) => http.listen(port, "127.0.0.1", resolve));
+  try {
+    assert.deepEqual(await client.call({ url: `http://127.0.0.1:${port}/test`, data: {} }), { value: 7 });
+  } finally {
+    await new Promise<void>((resolve, reject) => http.close((e) => (e ? reject(e) : resolve())));
+    await server.close();
+  }
+});
+
+test("runs on Express, behind express.json(), via requestHandler()", async () => {
+  const server = new NegotiationServer({ requestTimeoutMs: 5_000 });
+  server.use({ "math.add": async ({ a, b }: any) => Number(a) + Number(b) });
+  server.handle("/test", async () => {
+    const name = await server.ask.getName();
+    const sum = await server.run.math.add({ a: 2, b: 3 });
+    return { name, sum };
+  });
+  const client = new NegotiationClient();
+  client.use({ getName: async () => "Alex" });
+
+  const app = express();
+  app.use(express.json()); // parser first on purpose: pre-parsed bodies must work
+  app.get("/health", (_req, res) => res.json({ ok: true }));
+  app.use(server.requestHandler());
+
+  const port = await findFreePort();
+  const http = createHttpServer(app);
+  await new Promise<void>((resolve) => http.listen(port, "127.0.0.1", resolve));
+  try {
+    const health = await fetch(`http://127.0.0.1:${port}/health`);
+    assert.deepEqual(await health.json(), { ok: true }); // user's own routes still work
+    assert.deepEqual(
+      await client.call({ url: `http://127.0.0.1:${port}/test`, data: {} }),
+      { name: "Alex", sum: 5 },
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) => http.close((e) => (e ? reject(e) : resolve())));
     await server.close();
   }
 });

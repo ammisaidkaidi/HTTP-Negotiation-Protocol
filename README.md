@@ -30,6 +30,45 @@ DATABASE_URL="postgres://user:password@localhost:5432/mydb" npm start
 
 For external callbacks from another machine, set `PUBLIC_BASE_URL` to a publicly reachable HTTPS URL and secure the application or reverse proxy. The generated callback URL contains an unguessable token, but this is not a substitute for your provider's signature verification where available.
 
+## Running on Express / other frameworks (v1.7.0)
+
+`NegotiationServer` does not have to own its HTTP server. `requestHandler()`
+returns a standard Node `(req, res)` handler implementing the whole protocol
+— routes, `/__negotiation/resume`, and external callbacks:
+
+```ts
+import express from "express";
+import { NegotiationServer } from "http-negotiation-protocol";
+
+const server = new NegotiationServer();
+server.handle("/example", /* ... */);
+
+const app = express();
+app.use(express.json());           // optional — pre-parsed bodies are honoured
+app.get("/health", (req, res) => res.json({ ok: true }));
+app.use(server.requestHandler());  // mount at the root, after your own routes
+app.listen(3000);
+```
+
+Rules:
+
+- **You own the HTTP server.** On shutdown, close your framework server and
+  also `await server.close()` — it rejects pending jobs and closes the store,
+  but never touches your server.
+- **Mount at the root** (route matching uses the full request path,
+  `originalUrl` included). Mount other middleware/routes before or after as
+  usual; anything that is not a negotiation route, the resume endpoint, or a
+  callback path is left to your app — except that unknown `POST` paths get
+  the protocol `404`, so mount negotiation last, or restrict it (below).
+- **Koa** works the same via the raw pair: `(ctx) => server.handleRequest(ctx.req, ctx.res)`
+  (disable your body parser for negotiation paths, or rely on the
+  pre-parsed-body support). **Fastify**: use `server.handleRequest(req.raw, res.raw)`
+  with `res.hijack()`. **Plain `node:http`**: `createServer(server.requestHandler())`.
+- **Hono / Next.js / fetch-style frameworks** use Web `Request`/`Response`
+  and need a fetch adapter — not yet provided; use `server.listen()` (its own
+  port) next to them for now.
+- Runnable example: `npm run demo:express` (`examples/express.ts`).
+
 ## Contract-first typed syntax (v1.6.0) — recommended
 
 Define services/actions **once** in a contract; both sides derive

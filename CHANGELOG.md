@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-10-13
+
+### Added
+
+- Framework integration: `server.requestHandler()` (standard Node
+  `(req, res)` handler) and `server.handleRequest(req, res)` run the whole
+  protocol — routes, resume endpoint, external callbacks — on top of
+  Express, Koa, Fastify (raw), or plain `node:http`, without the library
+  owning an HTTP server. Bodies pre-parsed by framework body parsers
+  (`req.body`) are honoured; `originalUrl` is used for routing when present.
+  Includes an Express integration test and `examples/express.ts`.
+  (Fetch-style frameworks such as Hono/Next.js still need `server.listen()`.)
+
 ## [1.6.0] - 2026-10-13
 
 ### Added

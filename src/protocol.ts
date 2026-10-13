@@ -398,6 +398,29 @@ function responseHeaders(res: Response): Record<string, string> {
 }
 
 async function readJson(req: IncomingMessage, maxBytes: number): Promise<any> {
+  // Framework mode (Express/Koa): a body parser may have already consumed
+  // the stream and left the parsed value on `req.body`. Honour it, otherwise
+  // reading the (ended) stream would silently yield an empty body.
+  const preparsed = (req as IncomingMessage & { body?: unknown }).body;
+  if (preparsed !== undefined) {
+    if (typeof preparsed === "string" || Buffer.isBuffer(preparsed)) {
+      const text = preparsed.toString();
+      if (Buffer.byteLength(text) > maxBytes) {
+        const error = new Error(`Request body exceeds ${maxBytes} bytes`);
+        (error as Error & { code: string }).code = "BODY_TOO_LARGE";
+        throw error;
+      }
+      if (!text) return {};
+      try {
+        return JSON.parse(text);
+      } catch {
+        const error = new Error("Request body must be valid JSON");
+        (error as Error & { code: string }).code = "INVALID_JSON";
+        throw error;
+      }
+    }
+    return preparsed;
+  }
   const chunks: Buffer[] = [];
   let length = 0;
   for await (const chunk of req) {
@@ -732,13 +755,37 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     });
   }
 
+  /**
+   * Framework integration (Express, Koa, Fastify-raw, plain `node:http`):
+   * a standard Node request handler implementing the whole protocol
+   * (routes, `/__negotiation/resume`, external callbacks).
+   *
+   *   const app = express();
+   *   app.use(express.json());            // optional; pre-parsed bodies are honoured
+   *   app.use(server.requestHandler());   // mount at the root
+   *
+   * In this mode you own the HTTP server: call `server.close()` on shutdown
+   * to reject pending jobs and close the store (it will not touch yours).
+   * Mount at the root: route matching uses the full request path.
+   */
+  requestHandler(): (req: IncomingMessage, res: ServerResponse) => void {
+    return (req, res) => {
+      void this.handleRequest(req, res);
+    };
+  }
+
+  /** Handle a single framework request; resolves when the turn is answered. */
+  async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    try {
+      await this.dispatch(req, res);
+    } catch (error) {
+      sendJson(res, 500, { ok: false, error: errorPayload(error) });
+    }
+  }
+
   async listen(port = 3000, host = "127.0.0.1"): Promise<void> {
     if (this.httpServer) throw new Error("Server is already listening");
-    this.httpServer = createHttpServer((req, res) => {
-      void this.dispatch(req, res).catch((error: unknown) => {
-        sendJson(res, 500, { ok: false, error: errorPayload(error) });
-      });
-    });
+    this.httpServer = createHttpServer(this.requestHandler());
     await new Promise<void>((resolve, reject) => {
       this.httpServer!.once("error", reject);
       this.httpServer!.listen(port, host, () => {
@@ -1204,7 +1251,8 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     const host = req.headers.host ?? "127.0.0.1";
     const forwardedProto = req.headers["x-forwarded-proto"];
     const origin = this.publicBaseUrl ?? `${Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto ?? "http"}://${host}`;
-    const url = new URL(req.url ?? "/", origin);
+    const expressUrl = (req as IncomingMessage & { originalUrl?: string }).originalUrl;
+    const url = new URL(expressUrl ?? req.url ?? "/", origin);
 
     if (req.method === "POST" && url.pathname === "/__negotiation/resume") {
       await this.handleResume(req, res);
