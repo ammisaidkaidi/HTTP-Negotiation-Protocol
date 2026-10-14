@@ -30,46 +30,59 @@ DATABASE_URL="postgres://user:password@localhost:5432/mydb" npm start
 
 For external callbacks from another machine, set `PUBLIC_BASE_URL` to a publicly reachable HTTPS URL and secure the application or reverse proxy. The generated callback URL contains an unguessable token, but this is not a substitute for your provider's signature verification where available.
 
-## Authentication (`src/auth/`, v1.9.0)
+## Authentication (auth negotiation, v1.9.0)
 
-A challenge-response auth manager for client and server, separate from the
-negotiation flow. One auth process:
+Authentication is itself a negotiation: the whole flow runs inside one
+logical `NegotiationClient.call()` to the server's auth route, with the
+server asking the client for everything it needs via client services.
 
 ```
-clientAuth <--> authManager (server)
-  1. client  -> begin
-  2. client <-> time sync: many fast requests; at the end the client and
-                server clocks must be identical within 50 ms (default),
-                otherwise the connection is closed (CLOCK_SKEW)
-  3. server  -> requests the uid
-  4. client  -> sends uid (server resolves pwd via its lookup function)
-  5. server  -> challenge, encrypted as encryption({data, challenge},
-                pwd + time\50): AES-256-GCM with key HKDF-SHA256(password,
-                bucket = floor(now/50)). `challenge` is a list of function
+clientAuth <--> authManager (server)          (one negotiation job)
+  1. client  -> begin: client.call(authUrl)
+  2. server  -> asks `auth.time` over several fast rounds; using the
+                fastest sample, client and server clocks must agree
+                within 20,000 ms (default), otherwise the negotiation is
+                closed (CLOCK_SKEW)
+  3. server  -> asks `auth.getUid`; client sends its uid (the server
+                resolves the per-user password via its lookup function)
+  4. server  -> asks `auth.solveChallenge`, sending the challenge
+                encrypted as encryption({data, challenge}, pwd + time\20000):
+                AES-256-GCM with key HKDF-SHA256(password,
+                bucket = floor(now/20000)). `challenge` is a list of function
                 names from the built-in registry of pure functions
-                f(x) => y (add1, double, square, xor42, ... in
-                src/auth/common.ts)
-  6. client  -> resolves the challenge and sends the result back,
+                f(x) => y (add1, double, square, xor42, ...)
+  5. client  -> resolves the challenge and returns the result,
                 encrypted the same way
-  7. server  -> validates the result; on success it FIRST saves the token
+  6. server  -> validates the result; on success it FIRST saves the token
                 to its registry (that save is what marks the auth as
-                successful), THEN sends the token to the client
-  8. client  -> sends ack; server marks the registry entry acknowledged
-                and closes the handshake. When the connection/process
-                closes, the client runs a fresh auth process next time.
+                successful), THEN delivers the token by asking
+                `auth.acceptToken`
+  7. client  -> stores the token and returns ack; the server marks the
+                registry entry acknowledged and the negotiation ends
+                (connection closed). When the connection/process closes,
+                the client runs a fresh auth negotiation next time.
 ```
 
 ```ts
+import { createServer } from "node:http";
 import { NegotiationClient, NegotiationServer } from "http-negotiation-protocol";
 import { ClientAuthManager, ServerAuthManager } from "http-negotiation-protocol/auth";
 
-// Bind the managers to your negotiation server/client (first argument):
+// Bind the managers to your negotiation server/client (first argument).
+// The server manager registers the /auth route on the negotiation server
+// in its constructor (this.server); it never creates an HTTP server of
+// its own, and NegotiationServer has no listen() either — you own HTTP.
 const negotiationServer = new NegotiationServer();
 const authServer = new ServerAuthManager(negotiationServer, {
   getPassword: async (uid) => users[uid],   // per-user password lookup
 });
-await authServer.listen(4000);  // /auth -> auth flow, everything else -> negotiationServer
+const http = createServer(authServer.requestHandler());
+authServer.attach(http);
+await authServer.listen(4000);  // starts the attached server: /auth + all negotiation routes
 
+// The client manager registers the auth services (auth.time, auth.getUid,
+// auth.solveChallenge, auth.acceptToken) on the negotiation client and
+// runs the auth negotiation through it.
 const negotiationClient = new NegotiationClient();
 const clientAuth = new ClientAuthManager(negotiationClient, {
   authUrl: "http://127.0.0.1:4000/auth",
@@ -83,20 +96,29 @@ authServer.validateToken(session.token);          // registry lookup -> entry?
 clientAuth.close();                               // forget token; header no longer sent
 ```
 
-The managers also still work standalone (omit the first argument) with
-their own `listen()`/`authUrl`, as in previous versions.
+`ClientAuthManager` must be bound to a `NegotiationClient` (first
+argument) — it has no standalone transport of its own. For
+`ServerAuthManager`, pass the `NegotiationServer` as the first argument
+(or the `server` option), create your HTTP server with
+`createServer(authServer.requestHandler())`, `attach()` it to the
+manager, and then call `authServer.listen(port)` to start that attached
+server (or just call `http.listen(...)` yourself — same thing).
+`listen()` rejects when there is no bound server or nothing attached.
 
 Notes:
 
 - Run it over **HTTPS** in production. Passwords are password-equivalents
   (whoever holds one can answer challenges), so source them from a secret
   manager / DB rather than hard-coding them.
-- The core is transport-agnostic: `authServer.handleAuthMessage(body)` is
-  the whole state machine; `requestHandler()` / `attach(http)` give it
-  Express/plain-HTTP hosting just like `NegotiationServer`.
-- The 50 ms budget is strict by design: it assumes fast local/edge links
-  and NTP-synced hosts. Both knobs (`maxClockSkewMs`, `timeBucketMs`,
-  `timeSamples`) are options on both managers.
+- Times are universal: the managers use UTC epoch milliseconds
+  (`utcNow()`), and `ServerAuthManager` records its startup instant as
+  `startedAtUtc` (ISO 8601 UTC), reset on `listen()`/`attach()`. The
+  default clock budget is 20,000 ms for both the accepted skew
+  (`maxClockSkewMs`) and the encryption bucket (`timeBucketMs`); use
+  NTP-synced hosts and tighten them via options if you need stricter
+  timing.
+- The auth services only answer while an auth negotiation is in progress,
+  and re-authentication overwrites the stored token on success.
 - Runnable demo: `npm run demo:auth` (`examples/auth.ts`). The library does
   not yet gate `NegotiationClient.call()` on a token — enforce
   `authServer.validateToken(token)` in your own routes/middleware if you
@@ -139,8 +161,9 @@ Rules:
   pre-parsed-body support). **Fastify**: use `server.handleRequest(req.raw, res.raw)`
   with `res.hijack()`. **Plain `node:http`**: `createServer(server.requestHandler())`.
 - **Hono / Next.js / fetch-style frameworks** use Web `Request`/`Response`
-  and need a fetch adapter — not yet provided; use `server.listen()` (its own
-  port) next to them for now.
+  and need a fetch adapter — not yet provided; run a plain
+  `createServer(server.requestHandler())` + `server.attach(http)` server
+  next to them for now (NegotiationServer has no `listen()` of its own).
 - Runnable example: `npm run demo:express` (`examples/express.ts`).
 
 ## Contract-first typed syntax (v1.6.0) — recommended
@@ -205,6 +228,7 @@ Notes:
 No string service/action names inside routes, and `return` replaces `server.end()`:
 
 ```ts
+import { createServer as createHttpServer } from "node:http";
 import { NegotiationClient, NegotiationServer } from "http-negotiation-protocol";
 
 const server = new NegotiationServer();
@@ -220,7 +244,10 @@ server.handle("/example", async () => {
 
 client.use({ getName: async () => "Alex" });
 
-await server.listen(3000);
+// NegotiationServer has no listen(): the application owns the HTTP server.
+const httpServer = createHttpServer(server.requestHandler());
+server.attach(httpServer);
+await new Promise<void>((resolve) => httpServer.listen(3000, "127.0.0.1", resolve));
 const result = await client.call({ url: "http://127.0.0.1:3000/example", data: {} });
 console.log(result); // { name: "Alex", sum: 5 }
 await server.close();
@@ -285,6 +312,7 @@ results["math.add"]; // 5, by full dotted name
 ## Minimal API (classic syntax)
 
 ```ts
+import { createServer as createHttpServer } from "node:http";
 import { NegotiationClient, NegotiationServer } from "http-negotiation-protocol";
 
 const server = new NegotiationServer();
@@ -304,7 +332,10 @@ client.use({
   getName: async () => "Alex",
 });
 
-await server.listen(3000);
+// NegotiationServer has no listen(): the application owns the HTTP server.
+const httpServer = createHttpServer(server.requestHandler());
+server.attach(httpServer);
+await new Promise<void>((resolve) => httpServer.listen(3000, "127.0.0.1", resolve));
 const result = await client.call({
   url: "http://127.0.0.1:3000/example",
   data: {},
@@ -328,6 +359,7 @@ await server.close();
 - `server.use(actions)` registers server-side actions.
 - `await server.call(name, data)` runs a server-side action.
 - `await server.callback(name, data, callbackPath?)` runs a server-side action that receives a generated `callbackUrl`, then waits for the external provider's POST result. No callback IDs or tokens are exposed to route code.
+- `server.requestHandler()` / `server.attach(httpServer)` / `await server.close()` host the protocol on an HTTP server you own: create it with `createServer(server.requestHandler())`, attach it, and call `http.listen(...)` yourself. There is intentionally no `server.listen()`.
 - `await server.end(result)` sends and stores the final result. A handler that returns a value without calling `end()` automatically ends with that value.
 - `server.respond(request, result)` remains available for code that prefers setting the result separately before `end()`.
 

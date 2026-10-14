@@ -23,22 +23,16 @@
   ],
   "sideEffects": false,
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+    "./package.json": "./package.json",
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "import": "./dist/client/index.js"
     },
-    "./protocol": {
-      "types": "./dist/protocol.d.ts",
-      "import": "./dist/protocol.js"
-    },
-    "./auth": {
-      "types": "./dist/auth/index.d.ts",
-      "import": "./dist/auth/index.js"
-    },
-    "./package.json": "./package.json"
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js"
+    }
   },
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
   "files": [
     "dist",
     "README.md",
@@ -49,20 +43,25 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "build:client": "esbuild src/client/index.ts --bundle --platform=browser --format=esm --target=es2022 --tsconfig=src/tsconfig-client.json --outfile=dist/client.js",
+    "build:server": "esbuild src/server/index.ts --bundle --platform=node --format=esm --target=node20 --tsconfig=src/tsconfig-server.json --outfile=dist/server.js",
+    "build:bundles": "npm run build:client && npm run build:server",
     "typecheck": "tsc -p tsconfig.json",
     "lint": "eslint .",
     "start": "tsx examples/demo.ts",
     "dev": "tsx examples/demo.ts",
     "demo": "tsx examples/demo.ts",
-    "test": "tsx --test src/protocol.test.ts src/auth/auth.test.ts",
+    "test": "tsx --test test/*.test.ts",
     "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build",
     "demo:express": "tsx examples/express.ts",
-    "demo:auth": "tsx examples/auth.ts"
+    "demo:auth": "tsx examples/auth.ts",
+    "demo:web": "tsx demo/server.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
     "@types/express": "^5.0.6",
     "@types/node": "^22.15.0",
+    "esbuild": "^0.28.2",
     "eslint": "^9.0.0",
     "express": "^5.3.0",
     "tsx": "^4.19.0",

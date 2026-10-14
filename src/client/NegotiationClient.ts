@@ -18,7 +18,7 @@ import {
   type HttpPluginRequest,
   type HttpPluginResponse,
   type ProvideFor,
-} from "./common.js";
+} from "../common/negotiations.js";
 
 function responseHeaders(res: Response): Record<string, string> {
   const output: Record<string, string> = {};

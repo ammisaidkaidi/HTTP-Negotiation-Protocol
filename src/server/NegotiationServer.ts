@@ -4,9 +4,7 @@
  * Extracted verbatim from the former single-file protocol.ts (v1.8).
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
-  createServer as createHttpServer,
   type IncomingMessage,
   type Server as HttpServer,
   type ServerResponse,
@@ -32,7 +30,12 @@ import {
   type ServerAction,
   type ServerRequest,
   type StoredRequestResponse,
-} from "./common.js";
+} from "../common/negotiations.js";
+import {
+  constantTimeEqual,
+  randomUuid,
+  sha256Hex,
+} from "../common/webCrypto.js";
 
 export class MemoryRequestStore implements RequestStore {
   readonly records = new Map<string, StoredRequestResponse>();
@@ -183,14 +186,12 @@ function redactedRequestForStorage(request: ServerRequest): ServerRequest {
 }
 
 /** Tokens are only ever stored as SHA-256 hashes and compared in constant time. */
-function tokenHash(token: string): string {
-  return createHash("sha256").update(token).digest("hex");
+async function tokenHash(token: string): Promise<string> {
+  return sha256Hex(token);
 }
 
-function tokensMatch(storedHash: string, providedToken: string): boolean {
-  const expected = Buffer.from(storedHash, "hex");
-  const actual = Buffer.from(tokenHash(providedToken), "hex");
-  return expected.length === actual.length && timingSafeEqual(expected, actual);
+async function tokensMatch(storedHash: string, providedToken: string): Promise<boolean> {
+  return constantTimeEqual(storedHash, await tokenHash(providedToken));
 }
 
 async function readJson(req: IncomingMessage, maxBytes: number): Promise<any> {
@@ -341,6 +342,16 @@ interface RunEntry {
 }
 
 
+/**
+ * Handler consulted before protocol routing. Return `true` if the request
+ * was handled (e.g. ServerAuthManager claiming its auth path), `false` to
+ * let the negotiation protocol handle it.
+ */
+export type HttpFallbackHandler = (
+  req: IncomingMessage,
+  res: ServerResponse,
+) => boolean | Promise<boolean>;
+
 export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   private readonly storage = new AsyncLocalStorage<JobContext>();
   private readonly routes = new Map<string, RouteHandler>();
@@ -357,6 +368,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   private readonly maxJobs: number;
   private readonly jobTimeoutMs: number;
   private readonly onError: NegotiationServerOptions["onError"];
+  private fallbackHandler: HttpFallbackHandler | undefined;
   readonly contract: C | undefined;
 
   constructor(options: (NegotiationServerOptions & { contract?: C }) = {}) {
@@ -526,8 +538,10 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   }
 
   /**
-   * The underlying HTTP server when this instance owns one (`listen()`)
-   * or is attached to an external one (`attach()`); otherwise `undefined`.
+   * The underlying HTTP server when this instance is attached to an
+   * external one (`attach()`); otherwise `undefined`. NegotiationServer
+   * deliberately has no `listen()` of its own: the application owns the
+   * HTTP server (see `requestHandler()` / `attach()`).
    */
   get httpServer(): HttpServer | undefined {
     return this.httpServerInstance;
@@ -544,7 +558,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
    *   rejected and the store is closed — exactly once;
    * - `server.close()` also closes the attached HTTP server.
    *
-   *   const http = createHttpServer(app);
+   *   const http = createServer(app);   // node:http, or your framework's server
    *   server.attach(http);
    *   http.listen(3000);
    *   // on shutdown: await server.close();  // closes http too
@@ -570,17 +584,15 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     return this;
   }
 
-  async listen(port = 3000, host = "127.0.0.1"): Promise<void> {
-    if (this.httpServerInstance) throw new Error("Server is already listening");
-    const httpServer = createHttpServer(this.requestHandler());
-    this.attach(httpServer);
-    await new Promise<void>((resolve, reject) => {
-      httpServer.once("error", reject);
-      httpServer.listen(port, host, () => {
-        httpServer.off("error", reject);
-        resolve();
-      });
-    });
+  /**
+   * Register a fallback HTTP handler consulted before protocol routing
+   * (used by ServerAuthManager to claim its `authPath` when it is bound to
+   * this server, so one attached HTTP server serves both). Pass
+   * `undefined` to remove it.
+   */
+  setFallbackHandler(handler: HttpFallbackHandler | undefined): this {
+    this.fallbackHandler = handler;
+    return this;
   }
 
   /** Idempotent negotiation cleanup: reject pending work and close the store, once. */
@@ -646,7 +658,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   ): Promise<T | T[] | ActionResult[]> {
     if (typeof input === "string") {
       const [result] = await this.requestClientActions([
-        { name: input, data, callbackID: `cb_${randomUUID()}` },
+        { name: input, data, callbackID: `cb_${randomUuid()}` },
       ]);
       if (!result) throw new Error(`Missing result for client action '${input}'`);
       return unwrapActionResult(result) as T;
@@ -656,7 +668,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       const actions = input.map((action) => ({
         name: action.name,
         data: action.data ?? null,
-        callbackID: `cb_${randomUUID()}`,
+        callbackID: `cb_${randomUuid()}`,
       }));
       const results = await this.requestClientActions(actions);
       return results.map((result, index) => {
@@ -852,8 +864,8 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
 
     // Rotate the resume token every round: a leaked token can only ever
     // resume the single round it was issued for, and only once.
-    const resumeToken = randomUUID();
-    context.resumeTokenHash = tokenHash(resumeToken);
+    const resumeToken = randomUuid();
+    context.resumeTokenHash = await tokenHash(resumeToken);
     const response: NegotiationResponse = {
       protocol: 1,
       jobId: context.jobId,
@@ -911,7 +923,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
    * callbackOrUrl can be a callback function or a callback endpoint URL/path.
    * The action receives { ...data, jobId, callbackID, callbackUrl }.
    */
-  createCallback<T = unknown>(
+  async createCallback<T = unknown>(
     request: ServerRequest,
     actionCall: ServerActionInvocation<unknown>,
     callbackOrUrl?: ((payload: T) => unknown | Promise<unknown>) | string,
@@ -921,8 +933,8 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       throw new TypeError("Server.createCallback expects Server.call(action, data) as its second argument");
     }
 
-    const callbackID = `cb_${randomUUID()}`;
-    const token = randomUUID();
+    const callbackID = `cb_${randomUuid()}`;
+    const token = randomUuid();
     const callbackBase = typeof callbackOrUrl === "string" ? callbackOrUrl : this.defaultCallbackPath;
     const base = this.publicBaseUrl ?? context.request.origin;
     const callbackURL = new URL(callbackBase, base);
@@ -933,7 +945,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
 
     const wait = deferred<T>();
     context.externalCallbacks.set(callbackID, {
-      tokenHash: tokenHash(token),
+      tokenHash: await tokenHash(token),
       result: wait as Deferred<unknown>,
       settled: false,
     });
@@ -1050,6 +1062,8 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     const expressUrl = (req as IncomingMessage & { originalUrl?: string }).originalUrl;
     const url = new URL(expressUrl ?? req.url ?? "/", origin);
 
+    if (this.fallbackHandler && (await this.fallbackHandler(req, res))) return;
+
     if (req.method === "POST" && url.pathname === "/__negotiation/resume") {
       await this.handleResume(req, res);
       return;
@@ -1085,10 +1099,10 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       return;
     }
 
-    const jobId = randomUUID();
+    const jobId = randomUuid();
     const context: JobContext = {
       jobId,
-      resumeTokenHash: tokenHash(randomUUID()),
+      resumeTokenHash: await tokenHash(randomUuid()),
       request: {
         jobId,
         method: req.method,
@@ -1147,7 +1161,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       sendJson(res, 404, { ok: false, error: { code: "UNKNOWN_JOB", message: "Job not found or already finished" } });
       return;
     }
-    if (typeof body.resumeToken !== "string" || !tokensMatch(context.resumeTokenHash, body.resumeToken)) {
+    if (typeof body.resumeToken !== "string" || !(await tokensMatch(context.resumeTokenHash, body.resumeToken))) {
       sendJson(res, 403, { ok: false, error: { code: "INVALID_RESUME_TOKEN", message: "Invalid resume token" } });
       return;
     }
@@ -1221,7 +1235,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     const token = url.searchParams.get("token") ?? "";
     const context = this.jobs.get(jobId);
     const callback = context?.externalCallbacks.get(callbackID);
-    if (!context || !callback || !tokensMatch(callback.tokenHash, token)) {
+    if (!context || !callback || !(await tokensMatch(callback.tokenHash, token))) {
       sendJson(res, 403, { ok: false, error: { code: "INVALID_CALLBACK", message: "Unknown callback or invalid token" } });
       return;
     }

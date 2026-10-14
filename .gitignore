@@ -10,3 +10,7 @@ coverage/
 .DS_Store
 *.log
 *.tsbuildinfo
+
+# Local npm cache and generated bundle archive (not source)
+.npm/
+dist.zip

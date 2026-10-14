@@ -1,9 +1,7 @@
 import { createServer as createHttpServer } from "node:http";
 import express from "express";
-import {
-  NegotiationClient,
-  NegotiationServer,
-} from "../src/protocol.js";
+import { NegotiationClient } from "../src/client/index.js";
+import { NegotiationServer } from "../src/server/index.js";
 
 // The negotiation server no longer needs to own an HTTP server:
 // requestHandler() plugs the whole protocol (routes, resume endpoint,

@@ -1,15 +1,18 @@
+import { createServer as createHttpServer } from "node:http";
 import {
   act,
-  createClient,
-  createServer,
   defineContract,
-  MemoryRequestStore,
-  PostgresRequestStore,
   svc,
   type ClientPlugin,
   type HttpPluginRequest,
   type HttpPluginResponse,
-} from "../src/protocol.js";
+} from "../src/common/negotiations.js";
+import { createClient } from "../src/client/index.js";
+import {
+  createServer,
+  MemoryRequestStore,
+  PostgresRequestStore,
+} from "../src/server/index.js";
 
 const port = Number(process.env.PORT ?? 3000);
 const publicBaseUrl = process.env.PUBLIC_BASE_URL ?? `http://127.0.0.1:${port}`;
@@ -215,7 +218,16 @@ async function main(): Promise<void> {
     }),
   });
 
-  await server.listen(port);
+  // NegotiationServer has no listen(): create and attach the HTTP server.
+  const httpServer = createHttpServer(server.requestHandler());
+  server.attach(httpServer);
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(port, "127.0.0.1", () => {
+      httpServer.off("error", reject);
+      resolve();
+    });
+  });
   console.log(`Negotiation demo listening on ${publicBaseUrl}`);
   if (!process.env.DATABASE_URL) {
     console.log("DATABASE_URL is not set: final records are stored in memory only.");

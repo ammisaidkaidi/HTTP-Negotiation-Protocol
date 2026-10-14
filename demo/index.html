@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>HTTP Negotiation Protocol — Web Demo</title>
+<style>
+  :root { color-scheme: dark; --bg:#0b1220; --card:#121a2e; --line:#24314f; --txt:#e7ecf7; --mut:#93a1bd; --acc:#5b9dff; --ok:#39d98a; --bad:#ff6b81; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--txt); }
+  header { padding:22px 26px 8px; }
+  h1 { margin:0; font-size:22px; }
+  header p { color:var(--mut); margin:6px 0 0; max-width:900px; line-height:1.45; }
+  main { display:grid; grid-template-columns: repeat(auto-fit,minmax(330px,1fr)); gap:16px; padding:18px 26px 26px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; }
+  .card h2 { margin:0 0 6px; font-size:16px; }
+  .card p { color:var(--mut); font-size:13px; line-height:1.5; }
+  label { display:block; font-size:12px; color:var(--mut); margin:10px 0 4px; }
+  input { width:100%; padding:9px 10px; border-radius:8px; border:1px solid var(--line); background:#0d1526; color:var(--txt); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+  button { padding:9px 14px; border-radius:9px; border:1px solid var(--line); background:#182540; color:var(--txt); cursor:pointer; font-weight:600; }
+  button:hover { border-color:var(--acc); }
+  button.primary { background:var(--acc); border-color:var(--acc); color:#071326; }
+  button:disabled { opacity:.55; cursor:wait; }
+  .badge { display:inline-block; padding:3px 9px; border-radius:999px; font-size:12px; border:1px solid var(--line); color:var(--mut); }
+  .badge.ok { color:var(--ok); border-color:var(--ok); }
+  .badge.bad { color:var(--bad); border-color:var(--bad); }
+  pre { background:#0d1526; border:1px solid var(--line); border-radius:10px; padding:12px; overflow:auto; font-size:12px; min-height:74px; white-space:pre-wrap; word-break:break-word; }
+  .log { overflow:auto; background:#0d1526; border:1px solid var(--line); border-radius:10px; padding:10px; font-family:ui-monospace, Menlo, monospace; font-size:12px; line-height:1.55; }
+  #browserLog { height:150px; margin-bottom:12px; }
+  #log { height:300px; }
+  .log .scope { color:var(--acc); }
+  .log .t { color:var(--mut); }
+  .log-title { margin:12px 0 6px; font-size:13px; color:var(--txt); }
+  code { color:#a9c8ff; }
+  .wide { grid-column: 1 / -1; }
+  .workflow { display:grid; gap:10px; margin-top:12px; }
+  .step { display:grid; grid-template-columns:34px 1fr auto; gap:12px; align-items:start;
+          border:1px solid var(--line); border-radius:12px; padding:12px 14px; background:#0d1526; }
+  .step .num { width:28px; height:28px; border-radius:50%; display:grid; place-items:center;
+               border:1px solid var(--line); color:var(--mut); font-weight:700; font-size:13px; }
+  .step h3 { margin:0 0 3px; font-size:14px; }
+  .step p { margin:0; color:var(--mut); font-size:12.5px; line-height:1.5; }
+  .step .actor { color:#a9c8ff; font-weight:600; }
+  .step .detail { display:block; margin-top:5px; color:var(--txt); font-family:ui-monospace, Menlo, monospace; font-size:11.5px; word-break:break-word; }
+  .step .status { padding:3px 9px; border-radius:999px; border:1px solid var(--line); color:var(--mut); font-size:11px; white-space:nowrap; }
+  .step[data-state="active"] { border-color:var(--acc); }
+  .step[data-state="active"] .num { border-color:var(--acc); color:var(--acc); }
+  .step[data-state="active"] .status { border-color:var(--acc); color:var(--acc); }
+  .step[data-state="done"] .num { border-color:var(--ok); color:var(--ok); }
+  .step[data-state="done"] .status { border-color:var(--ok); color:var(--ok); }
+  .step[data-state="fail"] { border-color:var(--bad); }
+  .step[data-state="fail"] .num { border-color:var(--bad); color:var(--bad); }
+  .step[data-state="fail"] .status { border-color:var(--bad); color:var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>HTTP Negotiation Protocol — Web Demo</h1>
+  <p>
+    This page loads the real client library in the browser: the <strong>Authenticate</strong>
+    button constructs a <code>ClientAuthManager</code> bound to a <code>NegotiationClient</code>
+    and calls <code>authenticate()</code> directly against <code>/auth</code> — there is no
+    <code>/api/auth</code> fetch endpoint. On the server, a <code>ServerAuthManager</code> is
+    bound to a <code>NegotiationServer</code> on the same HTTP server.
+    Demo account: <code>user1</code> / <code>correct-horse</code>.
+  </p>
+  <p>
+    <span id="authBadge" class="badge bad">not authenticated</span>
+    <span id="jobBadge" class="badge">jobs: 0</span>
+    <span id="offsetBadge" class="badge">clock offset: –</span>
+    <span id="serverTimeBadge" class="badge">server UTC: –</span>
+  </p>
+</header>
+
+<main>
+  <section class="card">
+    <h2>1 · Authenticate (auth manager)</h2>
+    <p>Button click → <code>new ClientAuthManager(negotiationClient, {...}).authenticate()</code>.
+       Runs the full flow: begin → 20,000&nbsp;ms time sync → uid → encrypted challenge
+       (<code>HKDF(pwd, time\20000)</code>) → token saved in the server registry → ack.</p>
+    <label for="uid">UID</label>
+    <input id="uid" value="user1" autocomplete="username" />
+    <label for="password">Password</label>
+    <input id="password" value="correct-horse" type="password" autocomplete="current-password" />
+    <div class="row">
+      <button id="btnAuth" class="primary">Authenticate</button>
+      <button id="btnLogout">Close (forget token)</button>
+    </div>
+    <label>Result</label>
+    <pre id="authOut">Not authenticated yet.</pre>
+  </section>
+
+
+  <section class="card wide">
+    <h2>Auth workflow — every operation, live</h2>
+    <p>Each step below is one operation of the auth negotiation. Press
+       <strong>Authenticate</strong> and watch the steps change:
+       <span class="badge">pending</span> → <span class="badge">active</span> →
+       <span class="badge ok">done</span> (or <span class="badge bad">failed</span>).
+       The page derives the live status from the real <code>auth.*</code> asks it receives
+       and from the server registry returned by <code>/api/state</code>.</p>
+    <div class="workflow" id="authWorkflow">
+      <div class="step" data-step="browser-client" data-state="pending">
+        <div class="num">1</div>
+        <div><h3>Browser creates the NegotiationClient</h3><p><span class="actor">Browser</span> — One <code>NegotiationClient</code> is created in the page. All later auth asks and normal calls go through this same client.</p><small class="detail"></small></div>
+        <span class="status">pending</span>
+      </div>
+      <div class="step" data-step="bind-manager" data-state="pending">
+        <div class="num">2</div>
+        <div><h3>Bind ClientAuthManager to the NegotiationClient</h3><p><span class="actor">Browser</span> — <code>new ClientAuthManager(negotiationClient, { authUrl: "/auth", uid, password, timeBucketMs: 20000 })</code> registers the <code>auth.*</code> services and the Bearer-token plugin on that client.</p><small class="detail"></small></div>
+        <span class="status">pending</span>
+      </div>
+      <div class="step" data-step="begin" data-state="pending">
+        <div class="num">3</div>
+        <div><h3>Begin the auth negotiation</h3><p><span class="actor">ClientAuthManager → ServerAuthManager</span> — <code>clientAuth.authenticate({ force: true })</code> starts one logical <code>negotiationClient.call("/auth", { begin: true })</code>; the <code>ServerAuthManager</code> route starts one auth job.</p><small class="detail"></small></div>
+        <span class="status">pending</span>
+      </div>
+      <div class="step" data-step="time" data-state="pending">
+        <div class="num">4</div>
+        <div><h3>Time synchronisation — server asks auth.time</h3><p><span class="actor">ServerAuthManager ⇄ auth.time service</span> — Over several fast rounds the server asks <code>auth.time</code>; the client returns UTC epoch milliseconds. Using the fastest sample, the clocks must agree within <code>20,000 ms</code>, otherwise the job fails with <code>CLOCK_SKEW</code>.</p><small class="detail"></small></div>
+        <span class="status">pending</span>
+      </div>
+      <div class="step" data-step="uid" data-state="pending">
+        <div class="num">5</div>
+        <div><h3>Server requests the UID and resolves the password</h3><p><span class="actor">ServerAuthManager ⇄ auth.getUid service</span> — The server asks <code>auth.getUid</code>; the client sends its uid, and the server resolves the per-user password with its <code>getPassword(uid)</code> lookup. Unknown uid → <code>UNKNOWN_UID</code>.</p><small class="detail"></small></div>
+        <span class="status">pending</span>
+      </div>
+      <div class="step" data-step="challenge" data-state="pending">
+        <div class="num">6</div>
+        <div><h3>Server creates the encrypted challenge</h3><p><span class="actor">ServerAuthManager</span> — The server builds <code>{ data, challenge, nonce }</code> (random data plus built-in function names such as <code>double</code>/<code>square</code>/<code>xor42</code>) and encrypts it with AES-256-GCM under a key derived by HKDF-SHA256 from the password and the UTC time bucket (<code>time\20000</code>), using Web Crypto.</p><small class="detail"></small></div>
+        <span class="status">pending</span>
+      </div>
+      <div class="step" data-step="solve" data-state="pending">
+        <div class="num">7</div>
+        <div><h3>Client solves the challenge</h3><p><span class="actor">auth.solveChallenge service</span> — The client decrypts the envelope, applies the named pure functions <code>f(x) =&gt; y</code> in order, and returns <code>{ result, nonce }</code> encrypted the same way.</p><small class="detail"></small></div>
+        <span class="status">pending</span>
+      </div>
+      <div class="step" data-step="validate" data-state="pending">
+        <div class="num">8</div>
+        <div><h3>Server validates the encrypted answer</h3><p><span class="actor">ServerAuthManager</span> — The server decrypts the answer and compares the nonce and result with the expected value. Wrong password or a tampered answer fails here (<code>DECRYPT_FAILED</code> / <code>CHALLENGE_FAILED</code>).</p><small class="detail"></small></div>
+        <span class="status">pending</span>
+      </div>
+      <div class="step" data-step="token" data-state="pending">
+        <div class="num">9</div>
+        <div><h3>Token is generated</h3><p><span class="actor">ServerAuthManager</span> — Only after validation succeeds, the server generates the session token (random bytes from a fresh <code>crypto.subtle.generateKey</code> AES-GCM key, exported and base64url-encoded).</p><small class="detail"></small></div>
+        <span class="status">pending</span>
+      </div>
+      <div class="step" data-step="registry" data-state="pending">
+        <div class="num">10</div>
+        <div><h3>Token is saved to the server registry FIRST</h3><p><span class="actor">ServerAuthManager registry</span> — The server does <code>registry.set(token, entry)</code> before the token leaves the server. That registry save is what marks the authentication as successful.</p><small class="detail"></small></div>
+        <span class="status">pending</span>
+      </div>
+      <div class="step" data-step="accept" data-state="pending">
+        <div class="num">11</div>
+        <div><h3>Token is delivered and the client returns ack</h3><p><span class="actor">ServerAuthManager ⇄ auth.acceptToken service</span> — The server asks <code>auth.acceptToken</code> with the token; the client stores the session in memory and returns <code>{ ack: true }</code>.</p><small class="detail"></small></div>
+        <span class="status">pending</span>
+      </div>
+      <div class="step" data-step="finish" data-state="pending">
+        <div class="num">12</div>
+        <div><h3>Registry is marked acknowledged and the job ends</h3><p><span class="actor">ServerAuthManager</span> — After the ack, the server marks the registry entry <code>acknowledged</code>, returns <code>{ authenticated, uid, expiresAt, clockOffsetMs }</code>, and the auth job/connection closes.</p><small class="detail"></small></div>
+        <span class="status">pending</span>
+      </div>
+      <div class="step" data-step="session" data-state="pending">
+        <div class="num">13</div>
+        <div><h3>Use the token — or close and re-authenticate</h3><p><span class="actor">NegotiationClient</span> — The bound client now sends <code>authorization: Bearer &lt;token&gt;</code> automatically (try “Call /whoami”). <code>clientAuth.close()</code> forgets the token, so the next authentication runs this whole workflow again and creates a new token.</p><small class="detail"></small></div>
+        <span class="status">pending</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>2 · Who am I? (token on negotiation calls)</h2>
+    <p>The same browser <code>NegotiationClient</code> used for authentication automatically sends
+       <code>authorization: Bearer &lt;token&gt;</code>. The <code>/whoami</code> route
+       validates it against the server registry.</p>
+    <div class="row">
+      <button id="btnWhoami" class="primary">Call /whoami</button>
+    </div>
+    <label>Result</label>
+    <pre id="whoOut">No call yet.</pre>
+  </section>
+
+  <section class="card">
+    <h2>3 · Run a negotiation (delivery estimate)</h2>
+    <p>One logical browser <code>negotiationClient.call()</code>: parallel client services in one round
+       (<code>asks()</code>), a server action (<code>run.*</code>), a slot selection
+       (<code>ask.*</code>), and an external carrier callback (<code>server.callback()</code>).</p>
+    <label for="orderId">Order ID</label>
+    <input id="orderId" value="ORD-WEB-1" />
+    <div class="row">
+      <button id="btnEstimate" class="primary">Run /delivery/estimate</button>
+    </div>
+    <label>Final result</label>
+    <pre id="estimateOut">No negotiation yet.</pre>
+  </section>
+
+  <section class="card wide">
+    <h2>Browser + server log</h2>
+    <p>Browser events come from the page's <code>NegotiationClient</code> and
+       <code>ClientAuthManager</code>; server events come from <code>demo/server.ts</code>.
+       <button id="btnRefresh">Refresh</button></p>
+    <div class="log-title">Browser log</div>
+    <div id="browserLog" class="log"></div>
+    <div class="log-title">Server log</div>
+    <div id="log" class="log"></div>
+  </section>
+</main>
+
+<script type="module">
+  import { ClientAuthManager, NegotiationClient } from "/browser-lib/client/index.js";
+
+  const $ = (id) => document.getElementById(id);
+  const show = (id, value) => { $(id).textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2); };
+  const escapeHtml = (value) => String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  const browserEvents = [];
+  function browserLog(scope, message) {
+    browserEvents.push({ time: new Date().toISOString(), scope, message: String(message) });
+    if (browserEvents.length > 60) browserEvents.shift();
+    const el = $("browserLog");
+    el.innerHTML = browserEvents.map((e) =>
+      '<div><span class="t">' + escapeHtml(e.time) + '</span> <span class="scope">[' + escapeHtml(e.scope) + "]</span> " +
+      escapeHtml(e.message) + "</div>").join("");
+    el.scrollTop = el.scrollHeight;
+  }
+
+
+  // ---- Live auth workflow panel -------------------------------------------
+  // The panel is driven by what this page actually observes: the protocol
+  // responses seen by the NegotiationClient plugin (which list the auth.*
+  // services the server is asking for), the authenticate() result, and the
+  // server registry returned by /api/state.
+  const stepEls = new Map([...document.querySelectorAll("[data-step]")].map((el) => [el.dataset.step, el]));
+  let workflowAuthActive = false;
+  let workflowCurrent = null;
+  let timeSamplesSeen = 0;
+
+  function setStep(id, state, detail) {
+    const el = stepEls.get(id);
+    if (!el) return;
+    el.dataset.state = state;
+    el.querySelector(".status").textContent = state;
+    if (detail !== undefined) el.querySelector(".detail").textContent = detail;
+    if (state === "active") workflowCurrent = id;
+    if ((state === "done" || state === "fail") && workflowCurrent === id) workflowCurrent = null;
+  }
+  function resetWorkflow() {
+    workflowCurrent = null;
+    timeSamplesSeen = 0;
+    for (const id of stepEls.keys()) setStep(id, "pending", "");
+  }
+  function failAuthWorkflow(error) {
+    const code = error?.code ?? "AUTH_FAILED";
+    const byCode = {
+      CLOCK_SKEW: "time", INVALID_TIME: "time",
+      UNKNOWN_UID: "uid", INVALID_UID: "uid",
+      DECRYPT_FAILED: "solve", CHALLENGE_FAILED: "validate",
+      UNKNOWN_CHALLENGE_FUNCTION: "solve", INVALID_ENVELOPE: "solve",
+      ENVELOPE_EXPIRED: "solve", WEB_CRYPTO_UNAVAILABLE: "solve",
+      ACK_FAILED: "accept", INVALID_TOKEN: "accept",
+    };
+    setStep(byCode[code] ?? workflowCurrent ?? "begin", "fail", code + ": " + (error?.message ?? String(error)));
+  }
+  function observeAuthResponse(body) {
+    if (!workflowAuthActive || !body || typeof body !== "object") return;
+    if (Array.isArray(body.actions)) {
+      for (const action of body.actions) {
+        if (action?.name === "auth.time") {
+          timeSamplesSeen += 1;
+          setStep("time", "active", "auth.time sample " + timeSamplesSeen + " requested by the server (round " + body.round + ")");
+        } else if (action?.name === "auth.getUid") {
+          setStep("time", "done", timeSamplesSeen + " time samples received; clock difference is within 20,000 ms");
+          setStep("uid", "active", "server asked auth.getUid; client sends its uid, server runs getPassword(uid)");
+        } else if (action?.name === "auth.solveChallenge") {
+          setStep("uid", "done", "uid accepted; password resolved on the server");
+          setStep("challenge", "done", "encrypted envelope received (bucket " + (action.data?.bucket ?? "?") + ", AES-256-GCM / HKDF-SHA256, time\\20000)");
+          setStep("solve", "active", "client decrypts, applies the challenge functions, and returns the encrypted answer");
+        } else if (action?.name === "auth.acceptToken") {
+          setStep("solve", "done", "encrypted answer returned to the server");
+          setStep("validate", "done", "server decrypted the answer; nonce and result match");
+          setStep("token", "done", "token generated on the server");
+          setStep("registry", "done", "registry.set(token) completed before this acceptToken ask was sent");
+          setStep("accept", "active", "client stores the token and returns { ack: true }");
+        }
+      }
+    }
+    if (body.done && body.error) failAuthWorkflow(body.error);
+    if (body.done && !body.error && workflowAuthActive) {
+      setStep("accept", "done", "ack accepted by the server");
+      setStep("finish", "active", "auth job is ending; result clockOffsetMs = " + (body.result?.clockOffsetMs ?? "–"));
+    }
+  }
+
+  // One browser-side NegotiationClient for the whole page. ClientAuthManager
+  // is bound to this exact client below, so after authenticate() this client
+  // automatically sends the Bearer token on /whoami and /delivery/estimate.
+  const negotiationClient = new NegotiationClient();
+  negotiationClient
+    .use({
+      onRequest: (request) => browserLog("client-plugin", request.phase + " -> " + request.url),
+      onResponse: (body, response) => {
+        browserLog("client-plugin", "HTTP " + response.status + " (" + response.phase + ")");
+        observeAuthResponse(body);
+      },
+      onError: (error, request) => browserLog("client-plugin", "ERROR " + request.phase + ": " + error.message),
+    })
+    .use({
+      getCurrentLocation: async () => {
+        const error = new Error("Location permission denied");
+        error.code = "PERMISSION_DENIED";
+        throw error; // the server asks() fallback (null) takes over
+      },
+      getDeliveryPreferences: async () => {
+        browserLog("client-service", "getDeliveryPreferences() -> afternoon, fragile");
+        return { preferredPeriod: "afternoon", fragileHandling: true };
+      },
+      selectDeliverySlot: async ({ slots }) => {
+        const slotId = slots.find((slot) => slot.id === "slot_16_18")?.id ?? "";
+        browserLog("client-service", "selectDeliverySlot() -> " + slotId);
+        return { slotId };
+      },
+    });
+
+  setStep("browser-client", "done", "NegotiationClient created in this page; auth URL base = " + window.location.origin);
+
+  let clientAuth;
+  let clientAuthKey;
+  function ensureClientAuth(uid, password) {
+    const key = uid + "\u0000" + password;
+    if (!clientAuth || clientAuthKey !== key) {
+      clientAuth?.close();
+      clientAuth = new ClientAuthManager(negotiationClient, {
+        authUrl: window.location.origin + "/auth",
+        uid,
+        password,
+        timeBucketMs: 20_000,
+      });
+      clientAuthKey = key;
+      browserLog("auth", "created ClientAuthManager bound to the browser NegotiationClient for " + uid);
+    }
+    return clientAuth;
+  }
+
+  async function refresh() {
+    try {
+      const s = await fetch("/api/state").then((r) => r.json());
+      const authenticated = clientAuth?.isAuthenticated() ?? false;
+      const token = clientAuth?.token;
+      const badge = $("authBadge");
+      badge.textContent = authenticated
+        ? ("authenticated as " + $("uid").value + " · token " + token.slice(0, 10) + "...")
+        : "not authenticated";
+      badge.className = "badge " + (authenticated ? "ok" : "bad");
+      $("jobBadge").textContent = "jobs: " + s.activeJobs + " · registry: " + s.registry.length;
+      const offset = clientAuth?.lastClockOffsetMs;
+      $("offsetBadge").textContent = "clock offset: " + (offset === undefined || offset === null ? "–" : Number(offset).toFixed(2) + " ms");
+      $("serverTimeBadge").textContent = "server UTC: " + (s.serverTimeUtc ?? "–");
+      if (authenticated && token) {
+        const entry = s.registry.find((e) => e.token === token.slice(0, 10) + "...");
+        if (entry?.acknowledged) {
+          setStep("registry", "done", "server registry entry for " + entry.uid + ": acknowledged = true, expires " + entry.expiresAt);
+          setStep("finish", "done", "registry acknowledged and the auth job has ended");
+          setStep("session", "active", "Bearer token is stored in ClientAuthManager and sent automatically");
+        }
+      }
+      $("log").innerHTML = s.events.map((e) =>
+        '<div><span class="t">' + escapeHtml(e.time) + '</span> <span class="scope">[' + escapeHtml(e.scope) + "]</span> " +
+        escapeHtml(e.message) + "</div>").join("");
+      $("log").scrollTop = $("log").scrollHeight;
+    } catch (e) { /* server not up yet */ }
+  }
+
+  async function act(buttonId, fn) {
+    const btn = $(buttonId);
+    btn.disabled = true;
+    try { await fn(); } finally { btn.disabled = false; await refresh(); }
+  }
+
+  $("btnAuth").onclick = () => act("btnAuth", async () => {
+    show("authOut", "Authenticating with ClientAuthManager + NegotiationClient...");
+    resetWorkflow();
+    setStep("browser-client", "done", "NegotiationClient is created in this page");
+    setStep("bind-manager", "active", "binding ClientAuthManager to the NegotiationClient...");
+    workflowAuthActive = true;
+    try {
+      const auth = ensureClientAuth($("uid").value, $("password").value);
+      setStep("bind-manager", "done", "ClientAuthManager bound; auth services registered on the NegotiationClient");
+      setStep("begin", "active", "clientAuth.authenticate({ force: true }) -> negotiationClient.call(\"" + window.location.origin + "/auth\", { begin: true })");
+      browserLog("auth", "Authenticate button -> clientAuth.authenticate({ force: true })");
+      const session = await auth.authenticate({ force: true });
+      workflowAuthActive = false;
+      setStep("begin", "done", "one logical auth negotiation completed for " + session.uid);
+      setStep("finish", "done", "authenticated as " + session.uid + "; clockOffsetMs = " + (auth.lastClockOffsetMs ?? "–"));
+      setStep("session", "active", "token stored; it will be sent automatically as authorization: Bearer <token>");
+      browserLog("auth", "authenticated as " + session.uid + "; token accepted and ack sent");
+      show("authOut", {
+        ok: true,
+        uid: session.uid,
+        tokenPreview: session.token.slice(0, 10) + "...",
+        expiresAt: session.expiresAt,
+        clockOffsetMs: auth.lastClockOffsetMs,
+      });
+    } catch (e) {
+      workflowAuthActive = false;
+      failAuthWorkflow(e);
+      browserLog("auth", "FAILED (" + (e.code ?? "AUTH_FAILED") + "): " + e.message);
+      show("authOut", { ok: false, code: e.code, message: e.message });
+    }
+  });
+
+  $("btnLogout").onclick = () => act("btnLogout", async () => {
+    clientAuth?.close();
+    workflowAuthActive = false;
+    resetWorkflow();
+    setStep("browser-client", "done", "NegotiationClient is still created in this page");
+    setStep("bind-manager", "done", "ClientAuthManager is bound, but its token was forgotten");
+    setStep("session", "done", "clientAuth.close() completed; the next Authenticate runs the full workflow again");
+    browserLog("auth", "clientAuth.close() -> token forgotten");
+    show("authOut", "Token forgotten (clientAuth.close()). Authenticate again to get a new one.");
+    show("whoOut", "No call yet.");
+  });
+
+  $("btnWhoami").onclick = () => act("btnWhoami", async () => {
+    show("whoOut", "Calling /whoami through the browser NegotiationClient...");
+    try {
+      const result = await negotiationClient.call({
+        url: window.location.origin + "/whoami",
+        data: {},
+      });
+      if (result?.authenticated) {
+        setStep("session", "done", "/whoami confirmed the Bearer token for " + result.uid);
+      }
+      show("whoOut", { ok: true, result });
+    } catch (e) { show("whoOut", { ok: false, code: e.code, message: e.message }); }
+  });
+
+  $("btnEstimate").onclick = () => act("btnEstimate", async () => {
+    show("estimateOut", "Negotiating through the browser NegotiationClient...");
+    try {
+      const result = await negotiationClient.call({
+        url: window.location.origin + "/delivery/estimate",
+        data: {
+          orderId: $("orderId").value || "ORD-WEB-1",
+          deliveryArea: "Ghardaia-Centre",
+        },
+      });
+      show("estimateOut", { ok: true, result });
+    } catch (e) { show("estimateOut", { ok: false, code: e.code, message: e.message }); }
+  });
+
+  $("btnRefresh").onclick = refresh;
+  browserLog("browser", "NegotiationClient created in the browser from /browser-lib/client/index.js");
+  refresh();
+  setInterval(refresh, 4000);
+</script>
+</body>
+</html>

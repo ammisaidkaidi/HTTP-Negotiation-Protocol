@@ -1,18 +1,17 @@
-import { NegotiationClient, NegotiationServer } from "../src/protocol.js";
-import {
-  ClientAuthManager,
-  ServerAuthManager,
-} from "../src/auth/index.js";
+import { createServer as createHttpServer } from "node:http";
+import { ClientAuthManager, NegotiationClient } from "../src/client/index.js";
+import { NegotiationServer, ServerAuthManager } from "../src/server/index.js";
 
-// Demo of the challenge-response auth flow in src/auth/, bound to the
+// Demo of the challenge-response auth flow (src/common/auth.ts + client/server managers), bound to the
 // negotiation client/server:
-//   begin -> time sync (clocks must agree within 50 ms) -> uid ->
-//   encrypted challenge (function names + data, key = HKDF(pwd, time\50))
+//   begin -> time sync (clocks must agree within 20,000 ms) -> uid ->
+//   encrypted challenge (function names + data, key = HKDF(pwd, time\20000))
 //   -> encrypted answer -> server saves token to its registry, sends it ->
 //   ack -> connection closed. After close(), a fresh auth process runs.
 //
-// ServerAuthManager(negotiationServer, ...) serves /auth itself and
-// delegates everything else to the NegotiationServer, on ONE HTTP server.
+// ServerAuthManager(negotiationServer, ...) registers /auth on the
+// NegotiationServer; one attached HTTP server serves both. (The
+// NegotiationServer has no listen() of its own — the app owns HTTP.)
 // ClientAuthManager(negotiationClient, ...) makes that client send
 // `authorization: Bearer <token>` automatically after authenticate().
 
@@ -39,6 +38,8 @@ async function main(): Promise<void> {
     // Per-user password lookup (could read a DB / secret manager instead).
     getPassword: async (uid) => users[uid],
   });
+  const httpServer = createHttpServer(authServer.requestHandler());
+  authServer.attach(httpServer);
   await authServer.listen(port, "127.0.0.1"); // serves /auth + negotiation routes
   console.log(`Auth + negotiation server listening on ${baseUrl} (auth at /auth)`);
 
