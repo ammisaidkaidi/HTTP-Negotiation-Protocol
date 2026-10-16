@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0] - 2026-10-16
+
+### Added
+
+- Formal server plugin API: `server.plugin(plugin | plugin[])` registers
+  `ServerPlugin` lifecycle hooks (`onJobStart`, `onRound`, `onJobEnd`,
+  `onJobError`), awaited in registration order for every negotiation job.
+  Throwing from `onJobStart`/`onRound` fails the job; throwing from
+  `onJobEnd`/`onJobError` is reported through the server's `onError`
+  option. Types are exported from `http-negotiation-protocol/server`.
+
+### Fixed
+
+- Stray corrupted token in `NegotiationServer.resolveServerActionName`
+  that broke compilation.
+
 ## [1.10.0] - 2026-10-13
 
 ### Changed

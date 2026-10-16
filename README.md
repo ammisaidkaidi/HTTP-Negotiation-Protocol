@@ -362,6 +362,36 @@ await server.close();
 - `server.requestHandler()` / `server.attach(httpServer)` / `await server.close()` host the protocol on an HTTP server you own: create it with `createServer(server.requestHandler())`, attach it, and call `http.listen(...)` yourself. There is intentionally no `server.listen()`.
 - `await server.end(result)` sends and stores the final result. A handler that returns a value without calling `end()` automatically ends with that value.
 - `server.respond(request, result)` remains available for code that prefers setting the result separately before `end()`.
+- `server.plugin(plugin | plugin[])` registers server plugins (job lifecycle hooks, below).
+
+### Server plugins
+
+A `ServerPlugin` observes — and can veto — every negotiation job through
+four awaited hooks, run in registration order:
+
+```ts
+import { NegotiationServer, type ServerPlugin } from "http-negotiation-protocol/server";
+
+const timing: ServerPlugin = {
+  name: "timing",
+  onJobStart: ({ jobId, path }) => console.log(`job ${jobId} started on ${path}`),
+  onRound:    ({ round, actions }) => console.log(`round ${round}: ${actions.map((a) => a.name).join(", ")}`),
+  onJobEnd:   ({ result }) => console.log("finished:", result),
+  onJobError: ({ error }) => console.error("failed:", error.message),
+};
+
+const server = new NegotiationServer();
+server.plugin(timing); // or server.plugin([timing, anotherPlugin])
+```
+
+Every hook receives the job context (`jobId`, `path`, `method`, `origin`,
+`round`, `startedAt`, `request`); `onRound` adds the round's `actions`,
+`onJobEnd` the final `result`, and `onJobError` the `error`. Error semantics
+mirror middleware: throwing from `onJobStart`/`onRound` **fails the job**
+(the client receives the error and `onJobError` fires), while throwing from
+`onJobEnd`/`onJobError` is only reported through the server's `onError`
+option and never changes the outcome. The client has the symmetric HTTP
+plugin API (`client.use({ onRequest, onResponse, onError })`).
 
 ## Protocol behavior
 

@@ -86,6 +86,50 @@ export interface ClientPlugin {
   onError?: (error: Error, request: HttpPluginRequest) => void | Promise<void>;
 }
 
+/** Job-scoped information passed to every `ServerPlugin` hook. */
+export interface ServerPluginJob {
+  jobId: string;
+  path: string;
+  method: string;
+  origin: string;
+  /** Current negotiation round (0 before the first round is issued). */
+  round: number;
+  startedAt: string;
+  request: ServerRequest;
+}
+
+/** Passed to `onRound`: one batch of client services issued in a single round. */
+export interface ServerPluginRound extends ServerPluginJob {
+  actions: ClientAction[];
+}
+
+/** Passed to `onJobEnd`: the job finished successfully with this final result. */
+export interface ServerPluginResult extends ServerPluginJob {
+  result: unknown;
+}
+
+/** Passed to `onJobError`: the job failed with this error. */
+export interface ServerPluginError extends ServerPluginJob {
+  error: Error;
+}
+
+/**
+ * Server-side plugin: lifecycle hooks for negotiation jobs, registered with
+ * `NegotiationServer.plugin()`. Hooks run in registration order and are
+ * awaited. Throwing from `onJobStart`/`onRound` fails the job (the error is
+ * delivered to the client and `onJobError` fires); throwing from
+ * `onJobEnd`/`onJobError` is only reported through the server's `onError`
+ * option and never changes the job's outcome.
+ */
+export interface ServerPlugin {
+  /** Optional label, handy when logging from inside hooks. */
+  name?: string;
+  onJobStart?: (job: ServerPluginJob) => void | Promise<void>;
+  onRound?: (round: ServerPluginRound) => void | Promise<void>;
+  onJobEnd?: (job: ServerPluginResult) => void | Promise<void>;
+  onJobError?: (job: ServerPluginError) => void | Promise<void>;
+}
+
 export type ClientService = (data: any) => unknown | Promise<unknown>;
 export type ClientServices = Record<string, ClientService>;
 export type ServerAction = (data: any, request?: ServerRequest) => unknown | Promise<unknown>;

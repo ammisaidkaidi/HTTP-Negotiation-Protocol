@@ -28,6 +28,8 @@ import {
   type RunFor,
   type RunsBuilder,
   type ServerAction,
+  type ServerPlugin,
+  type ServerPluginJob,
   type ServerRequest,
   type StoredRequestResponse,
 } from "../common/negotiations.js";
@@ -356,6 +358,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   private readonly storage = new AsyncLocalStorage<JobContext>();
   private readonly routes = new Map<string, RouteHandler>();
   private readonly actions = new Map<string, ServerAction>();
+  private readonly plugins: ServerPlugin[] = [];
   private readonly jobs = new Map<string, JobContext>();
   private readonly callbackPaths = new Set<string>();
   private readonly store: RequestStore;
@@ -427,6 +430,64 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       this.actions.set(name, action);
     }
     return this;
+  }
+
+  /**
+   * Register one or more server plugins: job lifecycle hooks
+   * (`onJobStart`, `onRound`, `onJobEnd`, `onJobError`) that run, in
+   * registration order, for every negotiation job. See `ServerPlugin`.
+   */
+  plugin(pluginOrPlugins: ServerPlugin | ServerPlugin[]): this {
+    const plugins = Array.isArray(pluginOrPlugins) ? pluginOrPlugins : [pluginOrPlugins];
+    for (const plugin of plugins) {
+      if (!isObjectRecord(plugin)) {
+        throw new TypeError("Server.plugin expects a plugin object (or an array of them)");
+      }
+      for (const hook of ["onJobStart", "onRound", "onJobEnd", "onJobError"] as const) {
+        if (plugin[hook] !== undefined && typeof plugin[hook] !== "function") {
+          throw new TypeError(`Server plugin hook '${hook}' must be a function`);
+        }
+      }
+      this.plugins.push(plugin);
+    }
+    return this;
+  }
+
+  private pluginJob(context: JobContext): ServerPluginJob {
+    return {
+      jobId: context.jobId,
+      path: context.request.path,
+      method: context.request.method,
+      origin: context.request.origin,
+      round: context.round,
+      startedAt: context.startedAt,
+      request: context.request,
+    };
+  }
+
+  /** Run a plugin hook across all plugins, in registration order. Errors propagate. */
+  private async runPlugins(
+    invoke: (plugin: ServerPlugin) => void | Promise<void>,
+  ): Promise<void> {
+    for (const plugin of this.plugins) {
+      await invoke(plugin);
+    }
+  }
+
+  /**
+   * Like runPlugins, but for end-of-life hooks: a throwing plugin is
+   * reported through the `onError` option and never changes the outcome.
+   */
+  private async runPluginsSafely(
+    context: JobContext,
+    phase: string,
+    invoke: (plugin: ServerPlugin) => void | Promise<void>,
+  ): Promise<void> {
+    try {
+      await this.runPlugins(invoke);
+    } catch (error) {
+      this.reportError(error, { jobId: context.jobId, path: context.request.path, phase });
+    }
   }
 
   /**
@@ -876,6 +937,8 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       resumeUrl: "/__negotiation/resume",
       resumeToken,
     };
+    await this.runPlugins((plugin) =>
+      plugin.onRound?.({ ...this.pluginJob(context), round, actions: inputActions }));
     this.sendProtocolResponse(context, response);
 
     const timeout = setTimeout(() => {
@@ -1002,6 +1065,8 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       response,
       createdAt: context.startedAt,
     });
+    await this.runPluginsSafely(context, "plugin:onJobEnd", (plugin) =>
+      plugin.onJobEnd?.({ ...this.pluginJob(context), result: response.result }));
     context.ended = true;
     context.latestOutgoing = response;
     this.sendJsonToCurrentResponse(context, response);
@@ -1129,6 +1194,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     // The handler remains suspended at Server.require() while separate HTTP requests resume it.
     await this.storage.run(context, async () => {
       try {
+        await this.runPlugins((plugin) => plugin.onJobStart?.(this.pluginJob(context)));
         const returned = await route(context.request);
         if (!context.ended) {
           if (!context.resultSet && returned !== undefined) {
@@ -1271,6 +1337,8 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     } catch (storeError) {
       this.reportError(storeError, { jobId: context.jobId, path: context.request.path, phase: "store" });
     }
+    await this.runPluginsSafely(context, "plugin:onJobError", (plugin) =>
+      plugin.onJobError?.({ ...this.pluginJob(context), error: toError(error) }));
     context.ended = true;
     context.latestOutgoing = response;
     const currentResponse = context.currentResponse;
@@ -1293,3 +1361,4 @@ export function createServer<C extends ContractDefinition>(
 
 
 export const Server = new NegotiationServer();
+;
