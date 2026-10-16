@@ -54,7 +54,6 @@
     "test": "tsx --test test/*.test.ts",
     "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build",
     "demo:express": "tsx examples/express.ts",
-    "demo:auth": "tsx examples/auth.ts",
     "demo:web": "tsx demo/server.ts"
   },
   "devDependencies": {
@@ -67,9 +66,6 @@
     "tsx": "^4.19.0",
     "typescript": "^5.8.0",
     "typescript-eslint": "^8.0.0"
-  },
-  "optionalDependencies": {
-    "pg": "^8.16.0"
   },
   "publishConfig": {
     "access": "public"

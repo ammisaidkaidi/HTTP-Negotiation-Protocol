@@ -8,18 +8,10 @@ import {
   type HttpPluginResponse,
 } from "../src/common/negotiations.js";
 import { createClient } from "../src/client/index.js";
-import {
-  createServer,
-  MemoryRequestStore,
-  PostgresRequestStore,
-} from "../src/server/index.js";
+import { createServer } from "../src/server/index.js";
 
 const port = Number(process.env.PORT ?? 3000);
 const publicBaseUrl = process.env.PUBLIC_BASE_URL ?? `http://127.0.0.1:${port}`;
-const store = process.env.DATABASE_URL
-  ? new PostgresRequestStore(process.env.DATABASE_URL)
-  : new MemoryRequestStore();
-
 interface Location {
   area: string;
 }
@@ -78,7 +70,6 @@ const contract = defineContract({
 
 const server = createServer(contract, {
   publicBaseUrl,
-  store,
   requestTimeoutMs: 120_000,
 });
 
@@ -229,10 +220,6 @@ async function main(): Promise<void> {
     });
   });
   console.log(`Negotiation demo listening on ${publicBaseUrl}`);
-  if (!process.env.DATABASE_URL) {
-    console.log("DATABASE_URL is not set: final records are stored in memory only.");
-  }
-
   try {
     const result = await client.call({
       url: `${publicBaseUrl}/delivery/estimate`,

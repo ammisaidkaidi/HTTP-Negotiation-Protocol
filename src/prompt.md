@@ -1,5 +1,12 @@
 # HTTP Negotiation Protocol — Full Prompt, Plan, and Workflow
 
+> **Current scope (post-1.12): core HTTP negotiation only.** The auth
+> feature (ClientAuthManager/ServerAuthManager, auth negotiation, token
+> registry) and database persistence (RequestStore/Postgres) described
+> in the historical sections below were **removed** — the library keeps
+> only NegotiationClient/NegotiationServer, rounds, asks/runs, external
+> callbacks, plugins, and the contract API. Do not reintroduce them.
+
 This file is the complete project brief for the **HTTP Negotiation Protocol**
 TypeScript library. It can be used as:
 
@@ -54,7 +61,7 @@ Server:
     jobs, and closes the store exactly once
   - getActiveCallCount()
 - createServer(contract, options?) for contract-first servers.
-- MemoryRequestStore and PostgresRequestStore request stores.
+- (Removed) request stores / database persistence.
 
 Important hosting decision:
 - NegotiationServer must NOT have a listen() method.
@@ -283,27 +290,23 @@ HTTP-Negotiation-Protocol/
 │   ├── tsconfig-server.json        # server project (bundler, noEmit)
 │   ├── client/
 │   │   ├── index.ts
-│   │   ├── NegotiationClient.ts    # call(), plugins, client services
-│   │   └── ClientAuthManager.ts    # auth.* services + authenticate()
+│   │   └── NegotiationClient.ts    # call(), plugins, client services
 │   ├── server/
 │   │   ├── index.ts
-│   │   ├── NegotiationServer.ts    # jobs, rounds, routes, callbacks
-│   │   └── ServerAuthManager.ts    # /auth negotiation route + registry
+│   │   └── NegotiationServer.ts    # jobs, rounds, routes, callbacks
 │   └── common/
 │       ├── negotiations.ts         # wire types, contracts, shared helpers
-│       ├── authCore.ts             # auth errors, time buckets, challenges
-│       ├── authCrypto.ts           # Web Crypto AES-GCM/HKDF envelopes
-│       ├── auth.ts                 # backwards-compatible auth barrel
-│       └── webCrypto.ts            # subtle/digest/random helpers (no node:crypto)
+│       └── webCrypto.ts            # token hashing / UUID helpers (Web Crypto)
 ├── test/
-│   └── auth.test.ts
+│   ├── scenarios.test.ts         # 100 end-to-end scenarios
+│   ├── server-plugin.test.ts
+│   └── client-plugin.test.ts
 ├── examples/
 │   ├── demo.ts                     # delivery-estimate negotiation demo
-│   ├── express.ts                  # Express/requestHandler/attach demo
-│   └── auth.ts                     # bound auth managers demo
+│   └── express.ts                  # Express/requestHandler/attach demo
 ├── demo/
 │   ├── server.ts                   # web demo server (page + library hosting)
-│   ├── index.html                  # web demo UI + live auth workflow panel
+│   ├── index.html                  # web demo UI (delivery-estimate negotiation)
 │   └── README.md
 ├── tsconfig.json                   # strict whole-project typecheck (noEmit)
 ├── tsconfig.build.json             # full package build to dist/

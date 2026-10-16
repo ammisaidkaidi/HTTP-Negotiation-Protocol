@@ -9,8 +9,8 @@ npm install http-negotiation-protocol
 Imports come from the two side-specific entry points:
 
 ```ts
-import { NegotiationClient, ClientAuthManager } from "http-negotiation-protocol/client";
-import { NegotiationServer, ServerAuthManager } from "http-negotiation-protocol/server";
+import { NegotiationClient } from "http-negotiation-protocol/client";
+import { NegotiationServer } from "http-negotiation-protocol/server";
 ```
 
 One rule applies to every server example below: **`NegotiationServer` has no
@@ -189,63 +189,48 @@ console.log(result);
 
 ---
 
-## 4. Authentication — auth as a negotiation (bound managers)
+## 4. Express (or any Node framework) — the server plugs into your app
 
-`ServerAuthManager` registers `/auth` on your `NegotiationServer`;
-`ClientAuthManager` runs the flow through your `NegotiationClient`
-(begin → time sync within 20,000 ms UTC → uid → encrypted challenge
-(AES-256-GCM/HKDF, Web Crypto) → token saved in the server registry → ack).
-After `authenticate()`, the same client automatically sends
-`authorization: Bearer <token>` on every call; `auth.close()` forgets it.
+`requestHandler()` returns a standard Node `(req, res)` handler, so the
+protocol mounts into an existing app. Attach the HTTP server so
+`server.close()` also closes HTTP and lifecycle events are wired.
 
 **Server**
 
 ```ts
 import { createServer as createHttpServer } from "node:http";
-import { NegotiationServer, ServerAuthManager } from "http-negotiation-protocol/server";
+import express from "express";
+import { NegotiationServer } from "http-negotiation-protocol/server";
 
-const users: Record<string, string> = { user1: "correct-horse" };
-
-const negotiationServer = new NegotiationServer();
-const authServer = new ServerAuthManager(negotiationServer, {
-  getPassword: async (uid) => users[uid], // per-user password lookup (DB, secrets, …)
+const server = new NegotiationServer();
+server.handle("/example", async () => {
+  const name = await server.ask.getName();
+  return { greeting: `Hello ${name}` };
 });
 
-negotiationServer.handle("/whoami", async (request) => {
-  const header = request.headers.authorization;
-  const token = typeof header === "string" && header.startsWith("Bearer ")
-    ? header.slice("Bearer ".length)
-    : "";
-  const entry = authServer.validateToken(token);
-  return { authenticated: entry !== undefined, uid: entry?.uid ?? null };
-});
+const app = express();
+app.use(express.json()); // optional — pre-parsed bodies are honoured
+app.get("/health", (_req, res) => res.json({ ok: true }));
+app.use(server.requestHandler()); // mount at the root, after your own routes
 
-const httpServer = createHttpServer(authServer.requestHandler());
-authServer.attach(httpServer);            // one HTTP server: /auth + all routes
-await authServer.listen(4000, "127.0.0.1"); // starts the attached HTTP server
+const http = createHttpServer(app);
+server.attach(http);
+await new Promise<void>((resolve) => http.listen(3000, "127.0.0.1", resolve));
 ```
 
 **Client**
 
 ```ts
-import { NegotiationClient, ClientAuthManager } from "http-negotiation-protocol/client";
+import { NegotiationClient } from "http-negotiation-protocol/client";
 
-const negotiationClient = new NegotiationClient();
-const auth = new ClientAuthManager(negotiationClient, {
-  authUrl: "http://127.0.0.1:4000/auth",
-  uid: "user1",
-  password: "correct-horse",
-});
+const client = new NegotiationClient();
+client.use({ getName: async () => "Alex" });
 
-await auth.authenticate(); // full auth negotiation; token now sent automatically
-
-const me = await negotiationClient.call({
-  url: "http://127.0.0.1:4000/whoami",
+const result = await client.call({
+  url: "http://127.0.0.1:3000/example",
   data: {},
 });
-console.log(me); // { authenticated: true, uid: "user1" }
-
-auth.close(); // forget the token — next authenticate() runs the flow again
+console.log(result); // { greeting: "Hello Alex" }
 ```
 
 ---

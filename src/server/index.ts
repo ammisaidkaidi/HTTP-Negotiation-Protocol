@@ -1,5 +1,4 @@
 export * from "./NegotiationServer.js";
-export * from "./ServerAuthManager.js";
 export { handledResult } from "../common/negotiations.js";
 export type {
   ServerPlugin,

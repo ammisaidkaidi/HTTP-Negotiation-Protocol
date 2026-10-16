@@ -159,7 +159,7 @@ export type ServerPluginError = ServerPluginCallError;
 /**
  * Return this from an `onCallStart` hook to handle the call yourself: the
  * remaining `onCallStart` plugins and the route handler are skipped, and the
- * call ends with `result` through the normal end path (RequestStore save and
+ * call ends with `result` through the normal end path (onCallEnd plugins
  * `onCallEnd` hooks still run). Create it with `handledResult(result)`.
  */
 export interface ServerPluginHandled {
@@ -322,18 +322,6 @@ export type ServerActionImplementations<C> = {
     ? (data: D, request?: ServerRequest) => R | Promise<R>
     : never;
 };
-
-export interface StoredRequestResponse {
-  jobId: string;
-  request: ServerRequest;
-  response: NegotiationResponse;
-  createdAt: string;
-}
-
-export interface RequestStore {
-  save(entry: StoredRequestResponse): Promise<void>;
-  close?(): Promise<void>;
-}
 
 /**
  * Magic client-service proxy (v1.3 syntax). Property access builds the

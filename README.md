@@ -20,109 +20,7 @@ npm start
 
 The demo starts a local HTTP server, runs a complete delivery-estimate flow, prints the final result, and stops. The client and server are separate objects in one process but communicate over real HTTP on `127.0.0.1:3000`.
 
-To use PostgreSQL for final request/response logs:
-
-```bash
-DATABASE_URL="postgres://user:password@localhost:5432/mydb" npm start
-```
-
-`PostgresRequestStore` creates the `negotiation_logs` table automatically. Without `DATABASE_URL`, the demo uses `MemoryRequestStore`; those logs are lost when the process exits.
-
 For external callbacks from another machine, set `PUBLIC_BASE_URL` to a publicly reachable HTTPS URL and secure the application or reverse proxy. The generated callback URL contains an unguessable token, but this is not a substitute for your provider's signature verification where available.
-
-## Authentication (auth negotiation, v1.9.0)
-
-Authentication is itself a negotiation: the whole flow runs inside one
-logical `NegotiationClient.call()` to the server's auth route, with the
-server asking the client for everything it needs via client services.
-
-```
-clientAuth <--> authManager (server)          (one negotiation job)
-  1. client  -> begin: client.call(authUrl)
-  2. server  -> asks `auth.time` over several fast rounds; using the
-                fastest sample, client and server clocks must agree
-                within 20,000 ms (default), otherwise the negotiation is
-                closed (CLOCK_SKEW)
-  3. server  -> asks `auth.getUid`; client sends its uid (the server
-                resolves the per-user password via its lookup function)
-  4. server  -> asks `auth.solveChallenge`, sending the challenge
-                encrypted as encryption({data, challenge}, pwd + time\20000):
-                AES-256-GCM with key HKDF-SHA256(password,
-                bucket = floor(now/20000)). `challenge` is a list of function
-                names from the built-in registry of pure functions
-                f(x) => y (add1, double, square, xor42, ...)
-  5. client  -> resolves the challenge and returns the result,
-                encrypted the same way
-  6. server  -> validates the result; on success it FIRST saves the token
-                to its registry (that save is what marks the auth as
-                successful), THEN delivers the token by asking
-                `auth.acceptToken`
-  7. client  -> stores the token and returns ack; the server marks the
-                registry entry acknowledged and the negotiation ends
-                (connection closed). When the connection/process closes,
-                the client runs a fresh auth negotiation next time.
-```
-
-```ts
-import { createServer } from "node:http";
-import { NegotiationClient, NegotiationServer } from "http-negotiation-protocol";
-import { ClientAuthManager, ServerAuthManager } from "http-negotiation-protocol/auth";
-
-// Bind the managers to your negotiation server/client (first argument).
-// The server manager registers the /auth route on the negotiation server
-// in its constructor (this.server); it never creates an HTTP server of
-// its own, and NegotiationServer has no listen() either — you own HTTP.
-const negotiationServer = new NegotiationServer();
-const authServer = new ServerAuthManager(negotiationServer, {
-  getPassword: async (uid) => users[uid],   // per-user password lookup
-});
-const http = createServer(authServer.requestHandler());
-authServer.attach(http);
-await authServer.listen(4000);  // starts the attached server: /auth + all negotiation routes
-
-// The client manager registers the auth services (auth.time, auth.getUid,
-// auth.solveChallenge, auth.acceptToken) on the negotiation client and
-// runs the auth negotiation through it.
-const negotiationClient = new NegotiationClient();
-const clientAuth = new ClientAuthManager(negotiationClient, {
-  authUrl: "http://127.0.0.1:4000/auth",
-  uid: "user1",
-  password: "correct-horse",
-});
-const session = await clientAuth.authenticate();  // { token, uid, expiresAt }
-// negotiationClient now sends `authorization: Bearer <token>` automatically:
-await negotiationClient.call({ url: "http://127.0.0.1:4000/example", data: {} });
-authServer.validateToken(session.token);          // registry lookup -> entry?
-clientAuth.close();                               // forget token; header no longer sent
-```
-
-`ClientAuthManager` must be bound to a `NegotiationClient` (first
-argument) — it has no standalone transport of its own. For
-`ServerAuthManager`, pass the `NegotiationServer` as the first argument
-(or the `server` option), create your HTTP server with
-`createServer(authServer.requestHandler())`, `attach()` it to the
-manager, and then call `authServer.listen(port)` to start that attached
-server (or just call `http.listen(...)` yourself — same thing).
-`listen()` rejects when there is no bound server or nothing attached.
-
-Notes:
-
-- Run it over **HTTPS** in production. Passwords are password-equivalents
-  (whoever holds one can answer challenges), so source them from a secret
-  manager / DB rather than hard-coding them.
-- Times are universal: the managers use UTC epoch milliseconds
-  (`utcNow()`), and `ServerAuthManager` records its startup instant as
-  `startedAtUtc` (ISO 8601 UTC), reset on `listen()`/`attach()`. The
-  default clock budget is 20,000 ms for both the accepted skew
-  (`maxClockSkewMs`) and the encryption bucket (`timeBucketMs`); use
-  NTP-synced hosts and tighten them via options if you need stricter
-  timing.
-- The auth services only answer while an auth negotiation is in progress,
-  and re-authentication overwrites the stored token on success.
-- Runnable demo: `npm run demo:auth` (`examples/auth.ts`). The library does
-  not yet gate `NegotiationClient.call()` on a token — enforce
-  `authServer.validateToken(token)` in your own routes/middleware if you
-  want that today.
 
 ## Running on Express / other frameworks (v1.7.0)
 
@@ -147,9 +45,9 @@ app.listen(3000);
 Rules:
 
 - **Lifecycle:** with plain `requestHandler()` you own the HTTP server and
-  `server.close()` only cleans up jobs/store. Prefer `server.attach(http)`
+  `server.close()` only cleans up jobs. Prefer `server.attach(http)`
   (as in `examples/express.ts`): `server.httpServer` is then set, HTTP
-  `error`/`close` events are wired (an external close cleans up jobs/store
+  `error`/`close` events are wired (an external close cleans up jobs
   exactly once), and a single `await server.close()` closes everything.
 - **Mount at the root** (route matching uses the full request path,
   `originalUrl` included). Mount other middleware/routes before or after as
@@ -362,7 +260,7 @@ await server.close();
 - `await server.call(name, data)` runs a server-side action.
 - `await server.callback(name, data, callbackPath?)` runs a server-side action that receives a generated `callbackUrl`, then waits for the external provider's POST result. No callback IDs or tokens are exposed to route code.
 - `server.requestHandler()` / `server.attach(httpServer)` / `await server.close()` host the protocol on an HTTP server you own: create it with `createServer(server.requestHandler())`, attach it, and call `http.listen(...)` yourself. There is intentionally no `server.listen()`.
-- `await server.end(result)` sends and stores the final result. A handler that returns a value without calling `end()` automatically ends with that value.
+- `await server.end(result)` sends the final result. A handler that returns a value without calling `end()` automatically ends with that value.
 - `server.respond(request, result)` remains available for code that prefers setting the result separately before `end()`.
 - `server.plugin(plugin | plugin[])` registers server plugins (job lifecycle hooks, below).
 
@@ -424,7 +322,6 @@ server.plugin({
 - The library generates `jobId`, `callbackID`, and private resume tokens internally.
 - Results are matched to the expected callback IDs; repeated external callbacks are acknowledged without settling the callback again.
 - Terminology: the `callbackID` on a client-service action is a *correlation ID* matching that action to its result (kept for wire compatibility) — it is not an external callback. Use `server.getActiveCallCount()` for diagnostics (`getJobCount()` is a deprecated alias), and `server.setPreHandler()` for pre-routing handlers (`setFallbackHandler()` is a deprecated alias — it runs before routing, not as a fallback).
-- `Server.end(result)` saves the original request and final response through the configured `RequestStore`.
 - Active jobs are held in memory. This version targets one server process; it does not recover pending jobs after a restart or coordinate multiple replicas.
 
 ## Options (v1.2.0)
@@ -454,8 +351,6 @@ server.plugin({
 
 - Resume tokens are **rotated every round** and are single-round; callback and
   resume tokens are stored only as SHA-256 hashes and compared in constant time.
-- Sensitive headers (`Authorization`, `Cookie`, `x-api-key`, …) are persisted
-  as `[REDACTED]` — credentials are never written to a `RequestStore`.
 - Abandoned jobs expire instead of leaking in memory, and `server.close()`
   rejects pending rounds/callbacks instead of hanging.
 
@@ -481,4 +376,4 @@ Release using the `NPM_TOKEN` repository secret.
 3. Treat client service names as allow-listed capabilities; never execute arbitrary code supplied in protocol messages.
 4. Set limits and timeouts on HTTP bodies, services, jobs, and external callbacks.
 5. Move active job state to durable shared storage before using multiple server replicas or requiring restart recovery.
-6. Use a durable store rather than `MemoryRequestStore` when request/response logs must survive restarts.
+6. Finished calls are not persisted by the library; log results in your own application code if you need an audit trail.

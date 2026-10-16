@@ -3,7 +3,6 @@ import { createServer as createHttpServer, type Server as HttpServer } from "nod
 import test from "node:test";
 import express from "express";
 import {
-  ClientAuthManager,
   createClient,
   haltRequest,
   NegotiationClient,
@@ -17,9 +16,7 @@ import {
 } from "../src/common/negotiations.js";
 import {
   createServer,
-  MemoryRequestStore,
   NegotiationServer,
-  ServerAuthManager,
   type ServerPlugin,
 } from "../src/server/index.js";
 
@@ -65,6 +62,7 @@ function buildServer(ctx: Ctx, server: NegotiationServer): void {
       return { accepted: true };
     },
     "carrier.never": async () => ({ accepted: true }),
+    "counter.next": async () => { ctx.events.push("count"); return ctx.events.filter((e) => e === "count").length; },
     "carrier.fail": async () => { throw new Error("carrier down"); },
   });
 
@@ -170,6 +168,24 @@ function buildServer(ctx: Ctx, server: NegotiationServer): void {
   });
   server.handle("/quote-never", async () => server.callback("carrier.never", { orderId: "ORD-X" }));
   server.handle("/quote-fail", async () => server.callback("carrier.fail", { orderId: "ORD-X" }));
+  server.handle("/explicit-end", async () => { await server.end({ via: "end" }); });
+  server.handle("/respond-end", async (request) => {
+    server.respond(request, { via: "respond" });
+    await server.end();
+  });
+  server.handle("/return-undefined", async () => undefined);
+  server.handle("/ask-three", async () => {
+    const name = await server.ask.getName();
+    const city = await server.ask.getCity();
+    const area = await server.ask.location.getArea({ precise: true });
+    return { name, city, area };
+  });
+  server.handle("/quote-custom-path", async (request) => {
+    const { orderId } = request.data as { orderId: string };
+    const quote = await server.callback("carrier.requestQuote", { orderId }, "/hooks/carrier");
+    return { orderId, quote };
+  });
+  server.handle("/count", async () => server.run.counter.next({}));
   server.handle("/fail-handler", async () => { throw new Error("handler exploded"); });
   server.handle("/fail-coded", async () => {
     throw Object.assign(new Error("teapot"), { code: "TEAPOT" });
@@ -208,14 +224,14 @@ async function withRig(
   fn: (rig: Rig) => Promise<void>,
   options: {
     requestTimeoutMs?: number;
+    jobTimeoutMs?: number;
     customize?: (server: NegotiationServer, ctx: Ctx) => void;
-    store?: MemoryRequestStore;
   } = {},
 ): Promise<void> {
   const ctx: Ctx = { events: [], serviceCalls: {}, capturedCallbackUrls: [], callbackPayloads: [] };
   const server = new NegotiationServer({
     requestTimeoutMs: options.requestTimeoutMs ?? 5_000,
-    ...(options.store ? { store: options.store } : {}),
+    ...(options.jobTimeoutMs !== undefined ? { jobTimeoutMs: options.jobTimeoutMs } : {}),
   });
   buildServer(ctx, server);
   options.customize?.(server, ctx);
@@ -235,55 +251,6 @@ async function withRig(
       return client;
     },
     close: () => server.close(),
-  };
-  try {
-    await fn(rig);
-  } finally {
-    await rig.close();
-  }
-}
-
-// Auth rig -------------------------------------------------------------------
-
-const PASSWORDS: Record<string, string> = { user1: "correct-horse" };
-
-interface AuthRig {
-  baseUrl: string;
-  negotiationServer: NegotiationServer;
-  authServer: ServerAuthManager;
-  makeAuthClient: (uid: string, password: string) => { client: NegotiationClient; auth: ClientAuthManager };
-  close: () => Promise<void>;
-}
-
-async function withAuthRig(fn: (rig: AuthRig) => Promise<void>): Promise<void> {
-  const negotiationServer = new NegotiationServer();
-  const authServer = new ServerAuthManager(negotiationServer, {
-    getPassword: async (uid) => PASSWORDS[uid],
-  });
-  negotiationServer.handle("/whoami", async (request) => {
-    const header = request.headers.authorization;
-    const token = typeof header === "string" && header.startsWith("Bearer ")
-      ? header.slice("Bearer ".length)
-      : "";
-    const entry = authServer.validateToken(token);
-    return { authenticated: entry !== undefined, uid: entry?.uid ?? null };
-  });
-  const http: HttpServer = createHttpServer(authServer.requestHandler());
-  authServer.attach(http);
-  await authServer.listen(0, "127.0.0.1");
-  const address = http.address();
-  if (!address || typeof address === "string") throw new Error("Could not bind auth server");
-  const baseUrl = `http://127.0.0.1:${address.port}`;
-  const rig: AuthRig = {
-    baseUrl,
-    negotiationServer,
-    authServer,
-    makeAuthClient: (uid, password) => {
-      const client = new NegotiationClient();
-      const auth = new ClientAuthManager(client, { authUrl: `${baseUrl}/auth`, uid, password });
-      return { client, auth };
-    },
-    close: () => authServer.close(),
   };
   try {
     await fn(rig);
@@ -781,75 +748,75 @@ add("G server actions receive the request context (path via second arg)", () => 
   assert.equal(seenPath, "/ctx");
 }));
 
-// H. Auth (10)
-add("H successful auth returns a session for the uid", () => withAuthRig(async (rig) => {
-  const { auth } = rig.makeAuthClient("user1", "correct-horse");
-  const session = await auth.authenticate();
-  assert.equal(session.uid, "user1");
-  assert.ok(session.token.length > 10);
-  assert.ok(auth.isAuthenticated());
+// H. Rounds & lifecycle (10)
+add("H explicit server.end(result) finishes the call", () => withRig(async (rig) => {
+  assert.deepEqual(await call(rig, "/explicit-end"), { via: "end" });
 }));
-add("H wrong password is rejected", () => withAuthRig(async (rig) => {
-  const { auth } = rig.makeAuthClient("user1", "wrong-password");
-  await assert.rejects(auth.authenticate());
-  assert.ok(!auth.isAuthenticated());
+add("H server.respond + end() finishes with the stored result", () => withRig(async (rig) => {
+  assert.deepEqual(await call(rig, "/respond-end"), { via: "respond" });
 }));
-add("H unknown uid is rejected", () => withAuthRig(async (rig) => {
-  const { auth } = rig.makeAuthClient("ghost", "whatever");
-  await assert.rejects(auth.authenticate(), /Unknown uid|UNKNOWN_UID/i);
+add("H handler returning undefined yields a null result", () => withRig(async (rig) => {
+  assert.equal(await call(rig, "/return-undefined"), null);
 }));
-add("H bound client sends the token automatically to /whoami", () => withAuthRig(async (rig) => {
-  const { client, auth } = rig.makeAuthClient("user1", "correct-horse");
-  await auth.authenticate();
-  assert.deepEqual(await client.call({ url: `${rig.baseUrl}/whoami`, data: {} }), {
-    authenticated: true, uid: "user1",
+add("H three sequential rounds resolve in order", () => withRig(async (rig) => {
+  assert.deepEqual(await call(rig, "/ask-three"), { name: "Alex", city: "Graz", area: "Ghardaia-Centre" });
+  assert.equal(rig.ctx.serviceCalls.getName, 1);
+  assert.equal(rig.ctx.serviceCalls.getCity, 1);
+}));
+add("H batched asks are a single round carrying both actions", () => withRig(async (rig) => {
+  const rounds: string[][] = [];
+  rig.server.plugin({ onRound: (r) => { rounds.push(r.actions.map((a) => a.name)); } });
+  await call(rig, "/batch");
+  assert.deepEqual(rounds[0], ["getProfile", "getPreferences"]);
+}));
+add("H client constructor maxRounds option caps the call", () => withRig(async (rig) => {
+  const client = new NegotiationClient({ maxRounds: 1 });
+  client.use({ ...defaultServices(rig.ctx) });
+  await assert.rejects(client.call({ url: `${rig.baseUrl}/ask-two`, data: {} }), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "MAX_ROUNDS_EXCEEDED");
+    return true;
   });
 }));
-add("H unauthenticated client gets authenticated:false", () => withAuthRig(async (rig) => {
-  const { client } = rig.makeAuthClient("user1", "correct-horse");
-  assert.deepEqual(await client.call({ url: `${rig.baseUrl}/whoami`, data: {} }), {
-    authenticated: false, uid: null,
+add("H custom callback path is honoured by server.callback", () => withRig(async (rig) => {
+  const result = await call(rig, "/quote-custom-path", { orderId: "ORD-7" }) as { quote: { quoteId: string } };
+  assert.equal(result.quote.quoteId, "Q-ORD-7");
+  assert.match(rig.ctx.capturedCallbackUrls[0]!, /\/hooks\/carrier\?/);
+}));
+add("H stateful server action persists across calls (shared registry)", () => withRig(async (rig) => {
+  assert.equal(await call(rig, "/count"), 1);
+  assert.equal(await call(rig, "/count"), 2);
+  assert.equal(await call(rig, "/count"), 3);
+}));
+add("H job expiry rejects a waiting callback with JOB_EXPIRED", () => withRig(async (rig) => {
+  await assert.rejects(call(rig, "/quote-never"), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "JOB_EXPIRED");
+    return true;
   });
-}));
-add("H after close() the token is forgotten", () => withAuthRig(async (rig) => {
-  const { client, auth } = rig.makeAuthClient("user1", "correct-horse");
-  await auth.authenticate();
-  auth.close();
-  assert.ok(!auth.isAuthenticated());
-  assert.deepEqual(await client.call({ url: `${rig.baseUrl}/whoami`, data: {} }), {
-    authenticated: false, uid: null,
+}, { requestTimeoutMs: 5_000, jobTimeoutMs: 150 }));
+add("H contract server rejects asking for a service outside the contract", async () => {
+  const contract = defineContract({
+    client: { getName: defineService<string>() },
+    server: {},
   });
-}));
-add("H registry entry is acknowledged after a successful auth", () => withAuthRig(async (rig) => {
-  const { auth } = rig.makeAuthClient("user1", "correct-horse");
-  await auth.authenticate();
-  const entries = [...rig.authServer.registry.values()];
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0]?.acknowledged, true);
-  assert.equal(entries[0]?.uid, "user1");
-}));
-add("H validateToken resolves the session token", () => withAuthRig(async (rig) => {
-  const { auth } = rig.makeAuthClient("user1", "correct-horse");
-  const session = await auth.authenticate();
-  assert.equal(rig.authServer.validateToken(session.token)?.uid, "user1");
-}));
-add("H revoked token no longer validates or authenticates", () => withAuthRig(async (rig) => {
-  const { client, auth } = rig.makeAuthClient("user1", "correct-horse");
-  const session = await auth.authenticate();
-  assert.equal(rig.authServer.revokeToken(session.token), true);
-  assert.equal(rig.authServer.validateToken(session.token), undefined);
-  assert.deepEqual(await client.call({ url: `${rig.baseUrl}/whoami`, data: {} }), {
-    authenticated: false, uid: null,
-  });
-}));
-add("H re-authentication after close issues a fresh token", () => withAuthRig(async (rig) => {
-  const { auth } = rig.makeAuthClient("user1", "correct-horse");
-  const first = await auth.authenticate();
-  auth.close();
-  const second = await auth.authenticate();
-  assert.notEqual(first.token, second.token);
-  assert.equal(rig.authServer.registry.size, 2);
-}));
+  const server = createServer(contract);
+  // Deliberately ask outside the contract (cast: the type system rightly objects).
+  server.handle("/x", async () => (server.ask as any).getCity());
+  const http: HttpServer = createHttpServer(server.requestHandler());
+  server.attach(http);
+  await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
+  const address = http.address();
+  if (!address || typeof address === "string") throw new Error("bind failed");
+  try {
+    const client = createClient(contract);
+    client.provide({ getName: async () => "Alex" });
+    await assert.rejects(
+      client.call({ url: `http://127.0.0.1:${address.port}/x`, data: {} }),
+      /not defined in the contract/,
+    );
+  } finally {
+    await server.close();
+  }
+});
 
 // I. Integration & misc (6)
 add("I Express integration serves negotiations through requestHandler", async () => {
@@ -892,15 +859,11 @@ add("I fallback handler can claim non-protocol paths", () => withRig(async (rig)
   assert.deepEqual(await response.json(), { ok: true });
   assert.deepEqual(await call(rig, "/echo", "still-works"), "still-works");
 }));
-add("I MemoryRequestStore persists the finished job", async () => {
-  const store = new MemoryRequestStore();
-  await withRig(async (rig) => {
-    await call(rig, "/echo", { persisted: true });
-    assert.equal(store.records.size, 1);
-    const [record] = [...store.records.values()];
-    assert.equal(record?.response.done, true);
-  }, { store });
-});
+add("I route matching ignores the query string", () => withRig(async (rig) => {
+  const client = rig.makeClient();
+  const result = await client.call({ url: `${rig.baseUrl}/echo?source=test`, data: "qs" });
+  assert.equal(result, "qs");
+}));
 add("I contract-first createServer/createClient type the flow", async () => {
   const contract = defineContract({
     client: { getName: defineService<string>() },

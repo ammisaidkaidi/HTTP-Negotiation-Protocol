@@ -1,35 +1,24 @@
 import { createServer, type ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
-import {
-  NegotiationServer,
-  ServerAuthManager,
-} from "../src/server/index.js";
+import { NegotiationServer } from "../src/server/index.js";
 import ts from "typescript";
 
-// Server startup: reset this process's time zone to UTC+0 (universal
-// time). The auth negotiation itself compares UTC epoch milliseconds,
-// and all demo timestamps below are rendered as ISO UTC strings.
+// Render all demo timestamps as ISO UTC strings.
 process.env.TZ = "UTC";
 
 /**
  * Web demo for the library (see demo/index.html):
  *
- * - One HTTP server serves the web page, the auth endpoint (/auth), and
- *   the negotiation routes, via ServerAuthManager(negotiationServer, ...)
- *   + attach().
+ * - One HTTP server serves the web page and the negotiation routes,
+ *   via NegotiationServer + attach().
  * - The browser loads the actual client library modules from
  *   /browser-lib/* (TypeScript sources transpiled on demand). Its
- *   Authenticate button constructs a NegotiationClient and a
- *   ClientAuthManager in the page and calls authenticate() directly;
- *   there is deliberately no /api/auth fetch endpoint.
+ *   The page constructs a NegotiationClient in the browser and runs the
+ *   delivery-estimate negotiation through it directly.
  */
 
 const port = Number(process.env.PORT ?? 3000);
 const internalBaseUrl = `http://127.0.0.1:${port}`;
-
-const users: Record<string, string> = {
-  user1: "correct-horse",
-};
 
 interface EventEntry {
   time: string;
@@ -84,15 +73,6 @@ negotiationServer.use({
   },
 });
 
-negotiationServer.handle("/whoami", async (request) => {
-  const header = request.headers.authorization;
-  const token = typeof header === "string" && header.startsWith("Bearer ")
-    ? header.slice("Bearer ".length)
-    : "";
-  const entry = authServer.validateToken(token);
-  return { authenticated: entry !== undefined, uid: entry?.uid ?? null };
-});
-
 negotiationServer.handle("/delivery/estimate", async (request) => {
   const input = request.data as { orderId?: string; deliveryArea?: string } | null;
   if (!input?.orderId || !input.deliveryArea) {
@@ -138,15 +118,8 @@ negotiationServer.handle("/delivery/estimate", async (request) => {
   };
 });
 
-const authServer = new ServerAuthManager(negotiationServer, {
-  maxClockSkewMs: 20_000,
-  timeBucketMs: 20_000,
-  getPassword: async (uid) => users[uid],
-  onError: (error, info) => logEvent("auth", `FAILED during ${info.phase}: ${error.message}`),
-});
-
 // ---------------------------------------------------------------------------
-// Web server: page + /api/* + (/auth and negotiation routes via the library)
+// Web server: page + /api/* + (negotiation routes via the library)
 // ---------------------------------------------------------------------------
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -159,15 +132,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 
 function state(): Record<string, unknown> {
   return {
-    registry: [...authServer.registry.values()].map((entry) => ({
-      uid: entry.uid,
-      token: `${entry.token.slice(0, 10)}...`,
-      acknowledged: entry.acknowledged,
-      expiresAt: new Date(entry.expiresAt).toISOString(),
-    })),
     activeJobs: negotiationServer.getActiveCallCount(),
-    serverTimeUtc: authServer.universalTime,
-    serverStartedAtUtc: authServer.startedAtUtc,
     events,
   };
 }
@@ -176,8 +141,8 @@ function state(): Record<string, unknown> {
  * Serve the real client-side library sources to the browser. Only the
  * client/common modules are exposed; TypeScript's transpile-only output
  * preserves their relative .js import specifiers, which this same route
- * resolves on the next request. ClientAuthManager's auth crypto uses
- * Web Crypto, so no Node.js module reaches the browser.
+ * resolves on the next request. Only browser-safe modules are exposed,
+ * so no Node.js module reaches the browser.
  */
 async function sendBrowserModule(res: ServerResponse, modulePath: string): Promise<void> {
   const relative = modulePath.slice("/browser-lib/".length);
@@ -230,8 +195,8 @@ const http = createServer((req, res) => {
         return;
       }
 
-      // Everything else belongs to the library: /auth + negotiation routes.
-      authServer.requestHandler()(req, res);
+      // Everything else belongs to the library: negotiation routes.
+      negotiationServer.requestHandler()(req, res);
     } catch (error) {
       logEvent("api", `error: ${error instanceof Error ? error.message : String(error)}`);
       if (!res.writableEnded) {
@@ -241,14 +206,11 @@ const http = createServer((req, res) => {
   })();
 });
 
-// Combined hosting: auth manager and negotiation server share this HTTP server.
-authServer.attach(http);
 negotiationServer.attach(http);
 
 await new Promise<void>((resolve) => http.listen(port, "0.0.0.0", resolve));
-logEvent("time", `server time reset to universal time (UTC+0) at startup: ${authServer.startedAtUtc}`);
-logEvent("web", `demo listening on http://127.0.0.1:${port} (page + /auth + negotiation routes)`);
+logEvent("web", `demo listening on http://127.0.0.1:${port} (page + negotiation routes)`);
 
 process.on("SIGTERM", () => {
-  void authServer.close().finally(() => process.exit(0));
+  void negotiationServer.close().finally(() => process.exit(0));
 });

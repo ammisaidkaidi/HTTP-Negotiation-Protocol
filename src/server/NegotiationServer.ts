@@ -1,5 +1,5 @@
 /**
- * Server half of the protocol: NegotiationServer, request stores, the
+ * Server half of the protocol: NegotiationServer, the
  * ask/asks/run/runs syntaxes, framework integration, and createServer().
  * Extracted verbatim from the former single-file protocol.ts (v1.8).
  */
@@ -23,7 +23,6 @@ import {
   type EmptyContract,
   type ImplementFor,
   type NegotiationResponse,
-  type RequestStore,
   type RouteHandler,
   type RunFor,
   type RunsBuilder,
@@ -32,7 +31,6 @@ import {
   type ServerPluginCall,
   type ServerPluginHandled,
   type ServerRequest,
-  type StoredRequestResponse,
 } from "../common/negotiations.js";
 import {
   constantTimeEqual,
@@ -40,104 +38,9 @@ import {
   sha256Hex,
 } from "../common/webCrypto.js";
 
-export class MemoryRequestStore implements RequestStore {
-  readonly records = new Map<string, StoredRequestResponse>();
-
-  /** Bounded in-memory store: oldest entries are evicted beyond maxRecords. */
-  constructor(private readonly maxRecords = 1_000) {
-    if (!Number.isInteger(maxRecords) || maxRecords < 1) {
-      throw new TypeError("MemoryRequestStore maxRecords must be a positive integer");
-    }
-  }
-
-  async save(entry: StoredRequestResponse): Promise<void> {
-    // Delete first so re-saving a job refreshes its eviction order.
-    this.records.delete(entry.jobId);
-    this.records.set(entry.jobId, structuredClone(entry));
-    while (this.records.size > this.maxRecords) {
-      const oldest = this.records.keys().next().value;
-      if (oldest === undefined) break;
-      this.records.delete(oldest);
-    }
-  }
-}
-
-interface PgPoolLike {
-  query(sql: string, values?: unknown[]): Promise<unknown>;
-  end(): Promise<void>;
-}
-
-/** Persists final request/response pairs to PostgreSQL. Requires the optional `pg` package. */
-export class PostgresRequestStore implements RequestStore {
-  private readonly poolPromise: Promise<PgPoolLike>;
-  private initialized = false;
-  private initPromise: Promise<void> | undefined;
-
-  constructor(connectionString?: string) {
-    // Use a variable import so PostgreSQL types are not required by consumers
-    // that only use the default in-memory store.
-    const packageName = "pg";
-    this.poolPromise = import(packageName).then(({ Pool }) => new Pool(connectionString ? { connectionString } : {}) as PgPoolLike);
-  }
-
-  private async init(): Promise<void> {
-    if (this.initialized) return;
-    // Share one initialisation across concurrent save() calls.
-    this.initPromise ??= (async () => {
-      const pool = await this.poolPromise;
-      await pool.query(`
-        CREATE TABLE IF NOT EXISTS negotiation_logs (
-          job_id TEXT PRIMARY KEY,
-          request JSONB NOT NULL,
-          response JSONB NOT NULL,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-      `);
-      await pool.query(
-        `CREATE INDEX IF NOT EXISTS negotiation_logs_created_at_idx ON negotiation_logs (created_at)`,
-      );
-      this.initialized = true;
-    })();
-    try {
-      await this.initPromise;
-    } catch (error) {
-      this.initPromise = undefined; // Allow a later save() to retry.
-      throw error;
-    }
-  }
-
-  async save(entry: StoredRequestResponse): Promise<void> {
-    await this.init();
-    const pool = await this.poolPromise;
-    await pool.query(
-      `INSERT INTO negotiation_logs (job_id, request, response, created_at)
-       VALUES ($1, $2::jsonb, $3::jsonb, $4::timestamptz)
-       ON CONFLICT (job_id) DO UPDATE SET
-         request = EXCLUDED.request,
-         response = EXCLUDED.response,
-         created_at = EXCLUDED.created_at`,
-      [
-        entry.jobId,
-        JSON.stringify(entry.request),
-        JSON.stringify(entry.response),
-        entry.createdAt,
-      ],
-    );
-  }
-
-  async close(): Promise<void> {
-    try {
-      await (await this.poolPromise).end();
-    } catch {
-      // Pool never started (e.g. optional `pg` dependency missing): nothing to close.
-    }
-  }
-}
-
 export interface NegotiationServerOptions {
   publicBaseUrl?: string;
   callbackPath?: string;
-  store?: RequestStore;
   maxBodyBytes?: number;
   /** Timeout for one negotiation round (waiting for the client's results). Default 120_000. */
   requestTimeoutMs?: number;
@@ -171,24 +74,6 @@ function deferred<T>(): Deferred<T> {
 
 function headerRecord(headers: IncomingMessage["headers"]): ServerRequest["headers"] {
   return { ...headers };
-}
-
-const SENSITIVE_HEADERS = new Set([
-  "authorization",
-  "cookie",
-  "set-cookie",
-  "proxy-authorization",
-  "x-api-key",
-  "x-auth-token",
-]);
-
-/** Copy of a request safe to persist: credentials are never written to a RequestStore. */
-function redactedRequestForStorage(request: ServerRequest): ServerRequest {
-  const headers: ServerRequest["headers"] = {};
-  for (const [name, value] of Object.entries(request.headers)) {
-    headers[name] = SENSITIVE_HEADERS.has(name.toLowerCase()) ? "[REDACTED]" : value;
-  }
-  return { ...request, headers };
 }
 
 /** Tokens are only ever stored as SHA-256 hashes and compared in constant time. */
@@ -350,7 +235,7 @@ interface RunEntry {
 
 /**
  * Handler consulted before protocol routing. Return `true` if the request
- * was handled (e.g. ServerAuthManager claiming its auth path), `false` to
+ * was handled, `false` to let normal request handling continue.
  * let the negotiation protocol handle it.
  */
 export type HttpFallbackHandler = (
@@ -368,7 +253,6 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   private readonly plugins: ServerPlugin[] = [];
   private readonly jobs = new Map<string, JobContext>();
   private readonly callbackPaths = new Set<string>();
-  private readonly store: RequestStore;
   private httpServerInstance: HttpServer | undefined;
   private shutdownPromise: Promise<void> | undefined;
   private readonly publicBaseUrl: string | undefined;
@@ -384,7 +268,6 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
 
   constructor(options: (NegotiationServerOptions & { contract?: C }) = {}) {
     this.contract = options.contract;
-    this.store = options.store ?? new MemoryRequestStore();
     this.publicBaseUrl = options.publicBaseUrl;
     this.defaultCallbackPath = options.callbackPath ?? "/__negotiation/callback";
     this.callbackPaths.add(new URL(this.defaultCallbackPath, "http://localhost").pathname);
@@ -616,7 +499,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
    *
    * In this mode you own the HTTP server. Either call `server.attach(http)`
    * to wire close/error events and let `server.close()` close it too, or
-   * close it yourself and call `server.close()` for jobs/store cleanup only
+   * close it yourself and call `server.close()` for job cleanup only
    * (an unattached `close()` never touches your HTTP server).
    * Mount at the root: route matching uses the full request path.
    */
@@ -653,7 +536,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
    * - `httpServer` becomes inspectable (instead of always `undefined`);
    * - server "error" events are forwarded to the `onError` option;
    * - when the HTTP server emits "close" (for any reason), pending jobs are
-   *   rejected and the store is closed — exactly once;
+   *   rejected — exactly once;
    * - `server.close()` also closes the attached HTTP server.
    *
    *   const http = createServer(app);   // node:http, or your framework's server
@@ -661,7 +544,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
    *   http.listen(3000);
    *   // on shutdown: await server.close();  // closes http too
    *
-   * Without `attach()`, `close()` only cleans up jobs/store and never
+   * Without `attach()`, `close()` only cleans up jobs and never
    * touches your HTTP server.
    */
   attach(httpServer: HttpServer): this {
@@ -674,7 +557,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     const onClose = () => {
       httpServer.off("error", onError);
       if (this.httpServerInstance === httpServer) this.httpServerInstance = undefined;
-      // External shutdown path: clean up jobs/store even if close() is never called.
+      // External shutdown path: clean up jobs even if close() is never called.
       void this.shutdownNegotiation();
     };
     httpServer.on("error", onError);
@@ -684,7 +567,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
 
   /**
    * Register a pre-routing HTTP handler consulted before protocol routing
-   * (used by ServerAuthManager to claim its `authPath` when it is bound to
+   * (used by integrations to claim specific paths before negotiation
    * this server, so one attached HTTP server serves both). Return `true`
    * from the handler if it answered the request. Pass `undefined` to
    * remove it.
@@ -699,7 +582,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     return this.setPreHandler(handler);
   }
 
-  /** Idempotent negotiation cleanup: reject pending work and close the store, once. */
+  /** Idempotent negotiation cleanup: reject pending work, once. */
   private shutdownNegotiation(): Promise<void> {
     this.shutdownPromise ??= (async () => {
       // Fail every suspended job first so handlers unwind instead of hanging.
@@ -722,7 +605,6 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
         }
       }
       this.jobs.clear();
-      await this.store.close?.();
     })();
     return this.shutdownPromise;
   }
@@ -1119,12 +1001,6 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       result: context.resultSet ? context.result : null,
       actions: [],
     };
-    await this.store.save({
-      jobId: context.jobId,
-      request: redactedRequestForStorage(context.request),
-      response,
-      createdAt: context.startedAt,
-    });
     await this.runPluginsSafely(context, "plugin:onCallEnd", async (plugin) => {
       const payload = { ...this.pluginCall(context), result: response.result };
       await plugin.onCallEnd?.(payload);
@@ -1266,7 +1142,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
         const handled = await this.runJobStartPlugins(context);
         if (handled) {
           // A plugin answered the job itself: skip the route handler and
-          // finish through the normal end path (store + onNegotiationEnd hooks).
+          // finish through the normal end path (onNegotiationEnd hooks).
           context.result = handled.result;
           context.resultSet = true;
           await this.end();
@@ -1404,16 +1280,6 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       actions: [],
     };
     if (context.expiryTimer) clearTimeout(context.expiryTimer);
-    try {
-      await this.store.save({
-        jobId: context.jobId,
-        request: redactedRequestForStorage(context.request),
-        response,
-        createdAt: context.startedAt,
-      });
-    } catch (storeError) {
-      this.reportError(storeError, { jobId: context.jobId, path: context.request.path, phase: "store" });
-    }
     await this.runPluginsSafely(context, "plugin:onCallError", async (plugin) => {
       const payload = { ...this.pluginCall(context), error: toError(error) };
       await plugin.onCallError?.(payload);
