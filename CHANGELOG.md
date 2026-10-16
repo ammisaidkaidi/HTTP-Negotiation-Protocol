@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-10-16
+
+### Removed (breaking)
+
+- Authentication: `ClientAuthManager`, `ServerAuthManager` (and
+  `ServerAuthManagerOptions`), the auth negotiation flow, token registry,
+  and the auth example/test. The library no longer ships any auth feature.
+- Database persistence: `RequestStore`, `MemoryRequestStore`, and
+  `PostgresRequestStore`, the server `store` option, and the optional
+  `pg` dependency. Finished calls are no longer saved anywhere; keep your
+  own records via `onCallEnd` server plugins if you need them.
+
+### Changed
+
+- The project now keeps only the HTTP negotiation concept:
+  `NegotiationClient`/`NegotiationServer`, rounds, asks/runs, external
+  callbacks, plugins, and the contract-first API. The web demo no longer
+  has an auth panel or users.
+
 ## [1.12.0] - 2026-10-16
 
 ### Added
