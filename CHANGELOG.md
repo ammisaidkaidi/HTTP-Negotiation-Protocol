@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] - 2026-10-16
+
+### Added
+
+- Client plugin halt chain: `onRequest` may return `false`, or call
+  `haltRequest()`, to stop a request before fetch with a coded
+  `REQUEST_HALTED` error (routed through `onError`, which now also
+  observes errors thrown by `onRequest`/`onResponse` hooks).
+- Server plugin short-circuit: `onCallStart` may return
+  `handledResult(result)` to answer the call itself — remaining start
+  hooks and the route handler are skipped.
+- `callbackTimeoutMs` server option (defaults to `requestTimeoutMs`).
+- 100-scenario end-to-end test suite (`test/scenarios.test.ts`) and
+  `example.md` with five client/server examples.
+
+### Changed
+
+- Server plugin hooks renamed to `onCallStart` / `onCallEnd` /
+  `onCallError`; `onNegotiation*` and `onJob*` names remain as deprecated
+  aliases. Plugin payload types renamed to `ServerPluginCall*` (old
+  `ServerPlugin*Job/Result/Error/Round` names kept as type aliases).
+- Terminology: `setPreHandler()` (alias `setFallbackHandler`),
+  `getActiveCallCount()` (alias `getJobCount()`), `requestService()`
+  (deprecated alias `require()`), and docs promote
+  `defineService`/`defineAction` over `svc`/`act`.
+
 ## [1.11.0] - 2026-10-16
 
 ### Added

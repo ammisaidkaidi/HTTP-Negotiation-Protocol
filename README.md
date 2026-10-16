@@ -174,20 +174,20 @@ proxies:
 
 ```ts
 import {
-  act, createClient, createServer, defineContract, svc,
+  createClient, createServer, defineAction, defineContract, defineService,
 } from "http-negotiation-protocol";
 
 interface Slot { id: string }
 
 const contract = defineContract({
   client: {
-    getName: svc<{ name: string }>(),                              // () -> { name }
-    selectSlot: svc<{ slotId: string }, { slots: Slot[] }>(),      // (data) -> { slotId }
-    "location.getArea": svc<string, { precise: boolean }>(),
+    getName: defineService<{ name: string }>(),                    // () -> { name }
+    selectSlot: defineService<{ slotId: string }, { slots: Slot[] }>(), // (data) -> { slotId }
+    "location.getArea": defineService<string, { precise: boolean }>(),
   },
   server: {
-    "math.add": act<number, { a: number; b: number }>(),
-    "delivery.getAvailableSlots": act<Slot[]>(),
+    "math.add": defineAction<number, { a: number; b: number }>(),
+    "delivery.getAvailableSlots": defineAction<Slot[]>(),
   },
 });
 
@@ -214,8 +214,9 @@ client.provide({                            // implementations are checked too
 
 Notes:
 
-- `svc<Result, Data>()` / `act<Result, Data>()` are phantom-typed markers;
-  omit `Data` for no-argument services (`svc<{ name: string }>()`).
+- `defineService<Result, Data>()` / `defineAction<Result, Data>()` are phantom-typed markers
+  (`svc` / `act` remain as short aliases); omit `Data` for no-argument services
+  (`defineService<{ name: string }>()`).
 - `server.implement(...)` and `client.provide(...)` accept **subsets** —
   register the rest in a later call. Names outside the contract are
   rejected at runtime, as are `server.ask.*` calls outside the contract.
@@ -255,9 +256,10 @@ await server.close();
 
 Proxy rules:
 
-- `server.ask.<name>(data)` → `server.require("<name>", data)`; nest for dots: `server.ask.location.get()` → `"location.get"`.
+- `server.ask.<name>(data)` → `server.requestService("<name>", data)`; nest for dots: `server.ask.location.get()` → `"location.get"`.
 - `server.run.<name>(data)` → server actions; nest for dots (`server.run.math.add()`), use a bare leaf (`server.run.getAvailableSlots()` resolves `"delivery.getAvailableSlots"`), or a normalised name (`server.run.mathAdd()` → `"math.add"`). Ambiguous leaf names throw — use the full dotted path.
-- The classic string API (`server.require(...)`, `server.call(...)`, `server.end(...)`,
+- The classic string API (`server.requestService(...)` — `server.require(...)` is a deprecated
+  alias — `server.call(...)`, `server.end(...)`,
   `server.requireMany(...)` for parallel calls with `fallback`) remains fully supported
   and is still the way to pass fallbacks, explicit types, or low-level action results.
 
@@ -348,14 +350,14 @@ await server.close();
 
 ### Client
 
-- `client.use(plugin).use(services)` registers HTTP interceptors and client services.
+- `client.use(plugin).use(services)` registers HTTP interceptors and client services. Client plugins form an awaited chain before every fetch: `onRequest` may mutate or replace the request, **return `false` (or throw / call `haltRequest()`) to halt it** with a coded `REQUEST_HALTED` error routed through `onError`, and `onResponse` may replace the response body.
 - `client.call({ url, params, data, headers })` runs all negotiation rounds and returns the final result.
 
 ### Server
 
 - `server.handle(path, handler)` registers an HTTP route.
-- `server.require(name, data)` asks the client to execute one service and returns its result. A failed service throws an Error; handle it with `try/catch`.
-- `server.requireMany([{ name, data, fallback }])` executes several client services in parallel in one negotiation round. `fallback` is used if that service fails; an omitted fallback means failure throws.
+- `server.requestService(name, data)` asks the client to execute one service and returns its result (`server.require(...)` is a deprecated alias). A failed service throws an Error; handle it with `try/catch`.
+- `server.requestService([{ name, data, fallback }])` / `server.requireMany(...)` executes several client services in parallel in one negotiation round. `fallback` is used if that service fails; an omitted fallback means failure throws.
 - `server.use(actions)` registers server-side actions.
 - `await server.call(name, data)` runs a server-side action.
 - `await server.callback(name, data, callbackPath?)` runs a server-side action that receives a generated `callbackUrl`, then waits for the external provider's POST result. No callback IDs or tokens are exposed to route code.
@@ -374,10 +376,10 @@ import { NegotiationServer, type ServerPlugin } from "http-negotiation-protocol/
 
 const timing: ServerPlugin = {
   name: "timing",
-  onJobStart: ({ jobId, path }) => console.log(`job ${jobId} started on ${path}`),
+  onCallStart: ({ jobId, path }) => console.log(`job ${jobId} started on ${path}`),
   onRound:    ({ round, actions }) => console.log(`round ${round}: ${actions.map((a) => a.name).join(", ")}`),
-  onJobEnd:   ({ result }) => console.log("finished:", result),
-  onJobError: ({ error }) => console.error("failed:", error.message),
+  onCallEnd:   ({ result }) => console.log("finished:", result),
+  onCallError: ({ error }) => console.error("failed:", error.message),
 };
 
 const server = new NegotiationServer();
@@ -386,12 +388,34 @@ server.plugin(timing); // or server.plugin([timing, anotherPlugin])
 
 Every hook receives the job context (`jobId`, `path`, `method`, `origin`,
 `round`, `startedAt`, `request`); `onRound` adds the round's `actions`,
-`onJobEnd` the final `result`, and `onJobError` the `error`. Error semantics
-mirror middleware: throwing from `onJobStart`/`onRound` **fails the job**
-(the client receives the error and `onJobError` fires), while throwing from
-`onJobEnd`/`onJobError` is only reported through the server's `onError`
+`onCallEnd` the final `result`, and `onCallError` the `error`. Error semantics
+mirror middleware: throwing from `onCallStart`/`onRound` **fails the job**
+(the client receives the error and `onCallError` fires), while throwing from
+`onCallEnd`/`onCallError` is only reported through the server's `onError`
 option and never changes the outcome. The client has the symmetric HTTP
 plugin API (`client.use({ onRequest, onResponse, onError })`).
+
+> The earlier names `onJobStart`/`onJobEnd`/`onJobError` and
+> `onNegotiationStart`/`onNegotiationEnd`/`onNegotiationError` still work
+> as deprecated aliases of the `onCall*` hooks.
+
+**Short-circuiting:** an `onCallStart` hook can also *answer the job itself*
+by returning `handledResult(result)` (imported from
+`http-negotiation-protocol/server`). The remaining `onCallStart` plugins and
+the route handler are skipped, and the job ends normally — RequestStore
+save and `onCallEnd` hooks still run:
+
+```ts
+import { handledResult } from "http-negotiation-protocol/server";
+
+server.plugin({
+  name: "cache",
+  onCallStart: ({ request }) => {
+    const cached = cache.get(request.path);
+    if (cached) return handledResult(cached); // handler never runs
+  },
+});
+```
 
 ## Protocol behavior
 
@@ -399,6 +423,7 @@ plugin API (`client.use({ onRequest, onResponse, onError })`).
 - Client services are allow-listed by registering them with `client.use({ serviceName: fn })`.
 - The library generates `jobId`, `callbackID`, and private resume tokens internally.
 - Results are matched to the expected callback IDs; repeated external callbacks are acknowledged without settling the callback again.
+- Terminology: the `callbackID` on a client-service action is a *correlation ID* matching that action to its result (kept for wire compatibility) — it is not an external callback. Use `server.getActiveCallCount()` for diagnostics (`getJobCount()` is a deprecated alias), and `server.setPreHandler()` for pre-routing handlers (`setFallbackHandler()` is a deprecated alias — it runs before routing, not as a fallback).
 - `Server.end(result)` saves the original request and final response through the configured `RequestStore`.
 - Active jobs are held in memory. This version targets one server process; it does not recover pending jobs after a restart or coordinate multiple replicas.
 
@@ -409,8 +434,9 @@ plugin API (`client.use({ onRequest, onResponse, onError })`).
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `maxBodyBytes` | `1_000_000` | Maximum JSON request body size |
-| `requestTimeoutMs` | `120_000` | Timeout for one negotiation round / external callback |
-| `jobTimeoutMs` | `600_000` | Overall lifetime of one logical job (`JOB_EXPIRED` afterwards) |
+| `requestTimeoutMs` | `120_000` | Timeout for one negotiation round (waiting for client results) |
+| `callbackTimeoutMs` | = `requestTimeoutMs` | Timeout waiting for an external callback (`server.callback`) |
+| `jobTimeoutMs` | `600_000` | Overall lifetime of one logical call (`JOB_EXPIRED` afterwards) |
 | `maxJobs` | `1000` | Maximum active jobs; new jobs get HTTP `503 TOO_MANY_JOBS` beyond this |
 | `onError(error, { jobId, path, phase })` | — | Structured error hook |
 

@@ -165,7 +165,7 @@ function state(): Record<string, unknown> {
       acknowledged: entry.acknowledged,
       expiresAt: new Date(entry.expiresAt).toISOString(),
     })),
-    activeJobs: negotiationServer.getJobCount(),
+    activeJobs: negotiationServer.getActiveCallCount(),
     serverTimeUtc: authServer.universalTime,
     serverStartedAtUtc: authServer.startedAtUtc,
     events,

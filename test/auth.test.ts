@@ -53,7 +53,7 @@ test("full auth flow: begin, time sync, uid, encrypted challenge, token in regis
     const entry = server.validateToken(session.token);
     assert.equal(entry?.uid, "user1");
     assert.equal(entry?.acknowledged, true);
-    assert.equal(server.server?.getJobCount(), 0); // auth job ended, connection closed
+    assert.equal(server.server?.getActiveCallCount(), 0); // auth job ended, connection closed
 
     // A second authenticate() reuses the still-valid in-memory token...
     const again = await client.authenticate();
@@ -99,7 +99,7 @@ test("auth fails when client and server clocks differ by more than 20,000 ms", a
     });
     await assert.rejects(skewed.authenticate(), (error: any) => error?.code === "CLOCK_SKEW");
     assert.equal(server.registry.size, 0);
-    assert.equal(server.server?.getJobCount(), 0);
+    assert.equal(server.server?.getActiveCallCount(), 0);
   });
 });
 

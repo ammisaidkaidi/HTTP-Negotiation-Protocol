@@ -1,7 +1,14 @@
 export * from "./NegotiationServer.js";
 export * from "./ServerAuthManager.js";
+export { handledResult } from "../common/negotiations.js";
 export type {
   ServerPlugin,
+  ServerPluginCall,
+  ServerPluginCallError,
+  ServerPluginCallResult,
+  ServerPluginCallRound,
+  ServerPluginHandled,
+  // Deprecated aliases (renamed to the ServerPluginCall* types above).
   ServerPluginError,
   ServerPluginJob,
   ServerPluginResult,

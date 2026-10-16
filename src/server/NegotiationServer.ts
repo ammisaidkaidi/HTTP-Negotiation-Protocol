@@ -29,7 +29,8 @@ import {
   type RunsBuilder,
   type ServerAction,
   type ServerPlugin,
-  type ServerPluginJob,
+  type ServerPluginCall,
+  type ServerPluginHandled,
   type ServerRequest,
   type StoredRequestResponse,
 } from "../common/negotiations.js";
@@ -138,7 +139,10 @@ export interface NegotiationServerOptions {
   callbackPath?: string;
   store?: RequestStore;
   maxBodyBytes?: number;
+  /** Timeout for one negotiation round (waiting for the client's results). Default 120_000. */
   requestTimeoutMs?: number;
+  /** Timeout waiting for an external callback. Defaults to `requestTimeoutMs`. */
+  callbackTimeoutMs?: number;
   /** Maximum simultaneously active jobs; new jobs get HTTP 503 beyond this. Default 1000. */
   maxJobs?: number;
   /** Overall lifetime of one logical job, across all rounds/callbacks. Default 600_000 (10 min). */
@@ -354,6 +358,9 @@ export type HttpFallbackHandler = (
   res: ServerResponse,
 ) => boolean | Promise<boolean>;
 
+/** Canonical name for `HttpFallbackHandler` (it runs before routing, not as a fallback). */
+export type HttpPreHandler = HttpFallbackHandler;
+
 export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   private readonly storage = new AsyncLocalStorage<JobContext>();
   private readonly routes = new Map<string, RouteHandler>();
@@ -368,6 +375,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   private readonly defaultCallbackPath: string;
   private readonly maxBodyBytes: number;
   private readonly requestTimeoutMs: number;
+  private readonly callbackTimeoutMs: number;
   private readonly maxJobs: number;
   private readonly jobTimeoutMs: number;
   private readonly onError: NegotiationServerOptions["onError"];
@@ -382,6 +390,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     this.callbackPaths.add(new URL(this.defaultCallbackPath, "http://localhost").pathname);
     this.maxBodyBytes = options.maxBodyBytes ?? 1_000_000;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 120_000;
+    this.callbackTimeoutMs = options.callbackTimeoutMs ?? this.requestTimeoutMs;
     this.maxJobs = options.maxJobs ?? 1_000;
     this.jobTimeoutMs = options.jobTimeoutMs ?? 600_000;
     this.onError = options.onError;
@@ -433,9 +442,11 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   }
 
   /**
-   * Register one or more server plugins: job lifecycle hooks
-   * (`onJobStart`, `onRound`, `onJobEnd`, `onJobError`) that run, in
-   * registration order, for every negotiation job. See `ServerPlugin`.
+   * Register one or more server plugins: lifecycle hooks
+   * (`onCallStart`, `onRound`, `onCallEnd`, `onCallError`) that run, in
+   * registration order, for every negotiation. See `ServerPlugin`.
+   * (The `onNegotiation*` and `onJob*` names are deprecated aliases and
+   * still work.)
    */
   plugin(pluginOrPlugins: ServerPlugin | ServerPlugin[]): this {
     const plugins = Array.isArray(pluginOrPlugins) ? pluginOrPlugins : [pluginOrPlugins];
@@ -443,7 +454,11 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       if (!isObjectRecord(plugin)) {
         throw new TypeError("Server.plugin expects a plugin object (or an array of them)");
       }
-      for (const hook of ["onJobStart", "onRound", "onJobEnd", "onJobError"] as const) {
+      for (const hook of [
+        "onCallStart", "onRound", "onCallEnd", "onCallError",
+        "onNegotiationStart", "onNegotiationEnd", "onNegotiationError",
+        "onJobStart", "onJobEnd", "onJobError",
+      ] as const) {
         if (plugin[hook] !== undefined && typeof plugin[hook] !== "function") {
           throw new TypeError(`Server plugin hook '${hook}' must be a function`);
         }
@@ -453,7 +468,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     return this;
   }
 
-  private pluginJob(context: JobContext): ServerPluginJob {
+  private pluginCall(context: JobContext): ServerPluginCall {
     return {
       jobId: context.jobId,
       path: context.request.path,
@@ -463,6 +478,28 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       startedAt: context.startedAt,
       request: context.request,
     };
+  }
+
+  /**
+   * Run `onCallStart` hooks in registration order (each plugin's
+   * deprecated aliases run right after its canonical hook). A
+   * hook returning a `ServerPluginHandled` short-circuits: remaining hooks
+   * and the route handler are skipped and that outcome is returned.
+   */
+  private async runJobStartPlugins(
+    context: JobContext,
+  ): Promise<ServerPluginHandled | undefined> {
+    for (const plugin of this.plugins) {
+      const job = this.pluginCall(context);
+      // Canonical hook first, then the deprecated aliases.
+      for (const hook of ["onCallStart", "onNegotiationStart", "onJobStart"] as const) {
+        const outcome = await plugin[hook]?.(job);
+        if (isObjectRecord(outcome) && outcome.handled === true) {
+          return outcome as ServerPluginHandled;
+        }
+      }
+    }
+    return undefined;
   }
 
   /** Run a plugin hook across all plugins, in registration order. Errors propagate. */
@@ -646,14 +683,20 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   }
 
   /**
-   * Register a fallback HTTP handler consulted before protocol routing
+   * Register a pre-routing HTTP handler consulted before protocol routing
    * (used by ServerAuthManager to claim its `authPath` when it is bound to
-   * this server, so one attached HTTP server serves both). Pass
-   * `undefined` to remove it.
+   * this server, so one attached HTTP server serves both). Return `true`
+   * from the handler if it answered the request. Pass `undefined` to
+   * remove it.
    */
-  setFallbackHandler(handler: HttpFallbackHandler | undefined): this {
+  setPreHandler(handler: HttpPreHandler | undefined): this {
     this.fallbackHandler = handler;
     return this;
+  }
+
+  /** @deprecated Use `setPreHandler` (same behaviour; the old name survives as an alias). */
+  setFallbackHandler(handler: HttpFallbackHandler | undefined): this {
+    return this.setPreHandler(handler);
   }
 
   /** Idempotent negotiation cleanup: reject pending work and close the store, once. */
@@ -707,6 +750,8 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   /**
    * Ask the client to execute one registered service and return its value.
    * Service errors become ordinary thrown Errors, so callers can use try/catch.
+   *
+   * @deprecated Prefer `requestService()` — identical behaviour, clearer name.
    */
   async require<T = unknown>(name: string, data?: unknown): Promise<T>;
   /** Ask the client to execute several registered services in one HTTP round. */
@@ -748,6 +793,21 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   /** Explicitly named alternative when a batch of client services is required. */
   async requireMany<T = unknown>(actions: ClientServiceRequest[]): Promise<T[]> {
     return await this.require<T>(actions);
+  }
+
+  /**
+   * Preferred name for `require()`: ask the client to execute one service
+   * (or several, as an array with per-service `fallback`s) and return the
+   * value(s). `require()` remains as a deprecated alias.
+   */
+  async requestService<T = unknown>(name: string, data?: unknown): Promise<T>;
+  async requestService<T = unknown>(actions: ClientServiceRequest[]): Promise<T[]>;
+  async requestService(input: { actions: ClientAction[] }): Promise<ActionResult[]>;
+  async requestService<T = unknown>(
+    input: string | ClientServiceRequest[] | { actions: ClientAction[] },
+    data?: unknown,
+  ): Promise<T | T[] | ActionResult[]> {
+    return this.require<T>(input as string, data) as Promise<T | T[] | ActionResult[]>;
   }
 
   /**
@@ -938,7 +998,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       resumeToken,
     };
     await this.runPlugins((plugin) =>
-      plugin.onRound?.({ ...this.pluginJob(context), round, actions: inputActions }));
+      plugin.onRound?.({ ...this.pluginCall(context), round, actions: inputActions }));
     this.sendProtocolResponse(context, response);
 
     const timeout = setTimeout(() => {
@@ -1033,7 +1093,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
         entry.settled = true;
         entry.result.reject(new Error(`External callback ${callbackID} timed out`));
       }
-    }, this.requestTimeoutMs);
+    }, this.callbackTimeoutMs);
 
     return wait.promise.then(async (payload) => {
       if (typeof callbackOrUrl === "function") await callbackOrUrl(payload);
@@ -1065,8 +1125,12 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       response,
       createdAt: context.startedAt,
     });
-    await this.runPluginsSafely(context, "plugin:onJobEnd", (plugin) =>
-      plugin.onJobEnd?.({ ...this.pluginJob(context), result: response.result }));
+    await this.runPluginsSafely(context, "plugin:onCallEnd", async (plugin) => {
+      const payload = { ...this.pluginCall(context), result: response.result };
+      await plugin.onCallEnd?.(payload);
+      await plugin.onNegotiationEnd?.(payload); // deprecated alias
+      await plugin.onJobEnd?.(payload); // deprecated alias
+    });
     context.ended = true;
     context.latestOutgoing = response;
     this.sendJsonToCurrentResponse(context, response);
@@ -1074,8 +1138,13 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   }
 
   /** Allows read-only diagnostics/testing without exposing the mutable jobs map. */
-  getJobCount(): number {
+  getActiveCallCount(): number {
     return this.jobs.size;
+  }
+
+  /** @deprecated Use `getActiveCallCount` (kept as an alias). */
+  getJobCount(): number {
+    return this.getActiveCallCount();
   }
 
   private requireContext(request?: ServerRequest): JobContext {
@@ -1194,7 +1263,15 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     // The handler remains suspended at Server.require() while separate HTTP requests resume it.
     await this.storage.run(context, async () => {
       try {
-        await this.runPlugins((plugin) => plugin.onJobStart?.(this.pluginJob(context)));
+        const handled = await this.runJobStartPlugins(context);
+        if (handled) {
+          // A plugin answered the job itself: skip the route handler and
+          // finish through the normal end path (store + onNegotiationEnd hooks).
+          context.result = handled.result;
+          context.resultSet = true;
+          await this.end();
+          return;
+        }
         const returned = await route(context.request);
         if (!context.ended) {
           if (!context.resultSet && returned !== undefined) {
@@ -1337,8 +1414,12 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     } catch (storeError) {
       this.reportError(storeError, { jobId: context.jobId, path: context.request.path, phase: "store" });
     }
-    await this.runPluginsSafely(context, "plugin:onJobError", (plugin) =>
-      plugin.onJobError?.({ ...this.pluginJob(context), error: toError(error) }));
+    await this.runPluginsSafely(context, "plugin:onCallError", async (plugin) => {
+      const payload = { ...this.pluginCall(context), error: toError(error) };
+      await plugin.onCallError?.(payload);
+      await plugin.onNegotiationError?.(payload); // deprecated alias
+      await plugin.onJobError?.(payload); // deprecated alias
+    });
     context.ended = true;
     context.latestOutgoing = response;
     const currentResponse = context.currentResponse;

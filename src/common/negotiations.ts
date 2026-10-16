@@ -29,6 +29,10 @@ export interface ServerRequest {
 export interface ClientAction {
   name: string;
   data: unknown;
+  /**
+   * Correlation ID matching this action to its `ActionResult`. The name is
+   * kept for wire compatibility — it is not an external-callback ID.
+   */
   callbackID: string;
 }
 
@@ -76,9 +80,16 @@ export interface HttpPluginResponse {
 }
 
 export interface ClientPlugin {
+  /**
+   * Runs (awaited, in registration order) before every HTTP round. Mutate
+   * the request in place, return a replacement request, or halt the chain:
+   * return `false` (or throw / call `haltRequest()`) to stop the request
+   * before fetch with a `REQUEST_HALTED` error, which is also routed
+   * through `onError`.
+   */
   onRequest?: (
     request: HttpPluginRequest,
-  ) => void | HttpPluginRequest | Promise<void | HttpPluginRequest>;
+  ) => void | false | HttpPluginRequest | Promise<void | false | HttpPluginRequest>;
   onResponse?: (
     body: unknown,
     response: HttpPluginResponse,
@@ -86,8 +97,28 @@ export interface ClientPlugin {
   onError?: (error: Error, request: HttpPluginRequest) => void | Promise<void>;
 }
 
-/** Job-scoped information passed to every `ServerPlugin` hook. */
-export interface ServerPluginJob {
+/** Error used when a client plugin halts a request before it is sent. */
+export class RequestHaltedError extends Error {
+  readonly code = "REQUEST_HALTED";
+
+  constructor(message = "Request halted by a client plugin") {
+    super(message);
+    this.name = "RequestHaltedError";
+  }
+}
+
+/**
+ * Halt the client plugin chain from inside an `onRequest` hook: the request
+ * is never sent, remaining plugins are skipped, `onError` hooks observe the
+ * error, and `client.call()` rejects with it. (Returning `false` from
+ * `onRequest` is the shorthand for `haltRequest()`.)
+ */
+export function haltRequest(message?: string): never {
+  throw new RequestHaltedError(message);
+}
+
+/** Call-scoped information passed to every `ServerPlugin` hook. */
+export interface ServerPluginCall {
   jobId: string;
   path: string;
   method: string;
@@ -98,36 +129,82 @@ export interface ServerPluginJob {
   request: ServerRequest;
 }
 
+/** @deprecated Use `ServerPluginCall`. */
+export type ServerPluginJob = ServerPluginCall;
+
 /** Passed to `onRound`: one batch of client services issued in a single round. */
-export interface ServerPluginRound extends ServerPluginJob {
+export interface ServerPluginCallRound extends ServerPluginCall {
   actions: ClientAction[];
 }
 
-/** Passed to `onJobEnd`: the job finished successfully with this final result. */
-export interface ServerPluginResult extends ServerPluginJob {
+/** @deprecated Use `ServerPluginCallRound`. */
+export type ServerPluginRound = ServerPluginCallRound;
+
+/** Passed to `onCallEnd`: the call finished successfully with this final result. */
+export interface ServerPluginCallResult extends ServerPluginCall {
   result: unknown;
 }
 
-/** Passed to `onJobError`: the job failed with this error. */
-export interface ServerPluginError extends ServerPluginJob {
+/** @deprecated Use `ServerPluginCallResult`. */
+export type ServerPluginResult = ServerPluginCallResult;
+
+/** Passed to `onCallError`: the call failed with this error. */
+export interface ServerPluginCallError extends ServerPluginCall {
   error: Error;
 }
 
+/** @deprecated Use `ServerPluginCallError`. */
+export type ServerPluginError = ServerPluginCallError;
+
 /**
- * Server-side plugin: lifecycle hooks for negotiation jobs, registered with
+ * Return this from an `onCallStart` hook to handle the call yourself: the
+ * remaining `onCallStart` plugins and the route handler are skipped, and the
+ * call ends with `result` through the normal end path (RequestStore save and
+ * `onCallEnd` hooks still run). Create it with `handledResult(result)`.
+ */
+export interface ServerPluginHandled {
+  handled: true;
+  result?: unknown;
+}
+
+/** Short-circuit helper for `onCallStart`: `return handledResult({ ... })`. */
+export function handledResult(result?: unknown): ServerPluginHandled {
+  return { handled: true, result };
+}
+
+/**
+ * Server-side plugin: lifecycle hooks for calls, registered with
  * `NegotiationServer.plugin()`. Hooks run in registration order and are
- * awaited. Throwing from `onJobStart`/`onRound` fails the job (the error is
- * delivered to the client and `onJobError` fires); throwing from
- * `onJobEnd`/`onJobError` is only reported through the server's `onError`
+ * awaited. Throwing from `onCallStart`/`onRound` fails the call (the error is
+ * delivered to the client and `onCallError` fires); throwing from
+ * `onCallEnd`/`onCallError` is only reported through the server's `onError`
  * option and never changes the job's outcome.
  */
 export interface ServerPlugin {
   /** Optional label, handy when logging from inside hooks. */
   name?: string;
-  onJobStart?: (job: ServerPluginJob) => void | Promise<void>;
-  onRound?: (round: ServerPluginRound) => void | Promise<void>;
-  onJobEnd?: (job: ServerPluginResult) => void | Promise<void>;
-  onJobError?: (job: ServerPluginError) => void | Promise<void>;
+  /**
+   * May return `handledResult(result)` to answer the call itself:
+   * remaining `onCallStart` plugins and the route handler are skipped.
+   */
+  onCallStart?: (
+    call: ServerPluginCall,
+  ) => void | ServerPluginHandled | Promise<void | ServerPluginHandled>;
+  onRound?: (round: ServerPluginCallRound) => void | Promise<void>;
+  onCallEnd?: (call: ServerPluginCallResult) => void | Promise<void>;
+  onCallError?: (call: ServerPluginCallError) => void | Promise<void>;
+  /** @deprecated Use `onCallStart`. Kept as a working alias. */
+  onNegotiationStart?: ServerPlugin["onCallStart"];
+  /** @deprecated Use `onCallEnd`. Kept as a working alias. */
+  onNegotiationEnd?: ServerPlugin["onCallEnd"];
+  /** @deprecated Use `onCallError`. Kept as a working alias. */
+  onNegotiationError?: ServerPlugin["onCallError"];
+  /** @deprecated Use `onCallStart`. Kept as a working alias. */
+  onJobStart?: ServerPlugin["onCallStart"];
+  /** @deprecated Use `onCallEnd`. Kept as a working alias. */
+  onJobEnd?: ServerPlugin["onCallEnd"];
+  /** @deprecated Use `onCallError`. Kept as a working alias. */
+  onJobError?: ServerPlugin["onCallError"];
 }
 
 export type ClientService = (data: any) => unknown | Promise<unknown>;

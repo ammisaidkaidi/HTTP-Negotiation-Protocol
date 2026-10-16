@@ -6,6 +6,7 @@
 import {
   errorPayload,
   isObjectRecord,
+  RequestHaltedError,
   toError,
   type ActionResult,
   type ClientAction,
@@ -19,6 +20,8 @@ import {
   type HttpPluginResponse,
   type ProvideFor,
 } from "../common/negotiations.js";
+
+export { haltRequest, RequestHaltedError } from "../common/negotiations.js";
 
 function responseHeaders(res: Response): Record<string, string> {
   const output: Record<string, string> = {};
@@ -207,14 +210,19 @@ export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
       body,
       phase,
     };
-    for (const plugin of this.plugins) {
-      if (plugin.onRequest) {
-        const changed = await plugin.onRequest(outgoing);
-        if (changed) outgoing = changed;
-      }
-    }
-
     try {
+      // Plugin chain: awaited in registration order before fetch. A plugin
+      // halts the chain by returning false, throwing, or calling
+      // haltRequest() — the request is never sent, the error is routed
+      // through onError below, and client.call() rejects with it.
+      for (const plugin of this.plugins) {
+        if (plugin.onRequest) {
+          const changed = await plugin.onRequest(outgoing);
+          if (changed === false) throw new RequestHaltedError();
+          if (changed) outgoing = changed;
+        }
+      }
+
       const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
       const fetchResponse = await fetch(outgoing.url, {
         method: outgoing.method,

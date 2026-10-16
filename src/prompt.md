@@ -52,7 +52,7 @@ Server:
   - httpServer getter
   - close() that closes the attached HTTP server if present, rejects pending
     jobs, and closes the store exactly once
-  - getJobCount()
+  - getActiveCallCount()
 - createServer(contract, options?) for contract-first servers.
 - MemoryRequestStore and PostgresRequestStore request stores.
 
