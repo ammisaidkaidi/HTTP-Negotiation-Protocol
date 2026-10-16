@@ -1,4 +1,4 @@
-# HTTP Negotiation Protocol — 5 Examples
+# HTTP Negotiation Protocol — Examples
 
 Install:
 
@@ -318,4 +318,227 @@ client.use({
     request.headers["x-permitted"] = "yes";
   },
 });
+```
+
+---
+
+## 6. Concurrent calls on one client instance (`Promise.all`)
+
+One `NegotiationClient` instance **can** run many `client.call()` operations
+at the same time. All per-call state (rounds, jobId, resume token) is local
+to each `call()`; the instance only shares services, plugins and timeouts.
+Each call becomes an independent job on the server (up to `maxJobs`,
+default 1000, then `503 TOO_MANY_JOBS`). There is no built-in queue or
+concurrency limit — every call starts immediately (see Example 9 to add one).
+
+**Server**
+
+```ts
+server.handle("/price", async (request) => {
+  const { sku } = request.data as { sku: string };
+  const local = await server.ask.lookupPrice({ sku }); // client service
+  return { sku, price: local };
+});
+```
+
+**Client**
+
+```ts
+const client = new NegotiationClient();
+client.use({
+  // NOTE: services run concurrently too — keep them stateless or
+  // concurrency-safe (no shared mutable counters without locking).
+  lookupPrice: async ({ sku }: { sku: string }) => priceBook[sku],
+});
+
+const [a, b, c] = await Promise.all([
+  client.call({ url: "http://127.0.0.1:3000/price", data: { sku: "A" } }),
+  client.call({ url: "http://127.0.0.1:3000/price", data: { sku: "B" } }),
+  client.call({ url: "http://127.0.0.1:3000/price", data: { sku: "C" } }),
+]);
+console.log(a, b, c);
+```
+
+---
+
+## 7. Server holds a request — suspended handler waiting for your own event
+
+The server holds the **logical** request, not the HTTP socket: whenever the
+handler awaits (a client service, `server.callback(...)`, or any promise of
+your own), the job is parked in memory and the handler resumes exactly
+where it stopped. Other requests keep flowing meanwhile.
+
+```ts
+import { EventEmitter, once } from "node:events";
+
+const server = new NegotiationServer({
+  jobTimeoutMs: 30 * 60_000, // a held job may live up to 30 min (default 600_000)
+});
+const payments = new EventEmitter();
+
+server.handle("/checkout", async (request) => {
+  const { orderId } = request.data as { orderId: string };
+
+  // The job is HELD here — no HTTP connection is kept open — until some
+  // other part of your app confirms the payment.
+  const [payment] = await once(payments, `paid:${orderId}`);
+  return { orderId, status: "paid", payment };
+});
+
+// Elsewhere in your app (webhook route, message consumer, admin action...):
+payments.emit("paid:ORD-9", { transactionId: "tx_123" });
+```
+
+Held jobs live only in this process's memory and are bounded by
+`jobTimeoutMs` overall (`requestTimeoutMs` bounds each individual round
+waiting for client results). `server.close()` rejects everything suspended.
+
+---
+
+## 8. Server plugin halts a request and answers it itself (`handledResult`)
+
+An `onCallStart` server plugin can **respond to the client and stop the
+rest of the pipeline**: return `handledResult(result)` and the remaining
+start plugins and the route handler are skipped; `client.call()` resolves
+with that result and `onCallEnd` still fires. Throwing instead fails the
+call (`client.call()` rejects, `onCallError` fires). Only `onCallStart`
+can short-circuit, and plugins never see the raw `res` — for raw HTTP
+control use `server.setPreHandler((req, res) => ...)` (returns `true` to
+claim the request before negotiation routing).
+
+```ts
+import { handledResult, NegotiationServer, type ServerPlugin } from "http-negotiation-protocol/server";
+
+// A "json guard": validates the payload and answers bad calls itself.
+const jsonGuard: ServerPlugin = {
+  name: "json-guard",
+  onCallStart: ({ request }) => {
+    if (request.path !== "/orders") return;              // not our route: continue
+    const data = request.data as { items?: unknown[] } | null;
+    if (!data || !Array.isArray(data.items) || data.items.length === 0) {
+      // Halt: handler never runs, client receives this as the final result.
+      return handledResult({ ok: false, error: "items must be a non-empty array" });
+    }
+    // return nothing → the call continues to the route handler
+  },
+};
+
+const server = new NegotiationServer();
+server.plugin(jsonGuard);
+server.handle("/orders", async () => ({ ok: true })); // only valid calls reach this
+```
+
+---
+
+## 9. Request-queue patterns (userland) — one-by-one, max-N, LIFO, latest-only
+
+The client has no built-in queue: every `call()` starts at once. If you
+need an execution policy, wrap the client. The queue schedules **whole
+logical calls** (rounds inside one call always stay together, in order).
+
+```ts
+import { NegotiationClient, type ClientCallRequest } from "http-negotiation-protocol/client";
+
+interface QueueOptions {
+  maxConcurrent?: number;      // default 1
+  order?: "fifo" | "lifo";     // default "fifo"
+  supersedeQueued?: boolean;   // drop still-queued calls when a new one arrives
+}
+
+interface Entry {
+  request: ClientCallRequest;
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  onAbort?: () => void;
+}
+
+export class CallQueue {
+  private running = 0;
+  private queued: Entry[] = [];
+  constructor(
+    private client: NegotiationClient,
+    private options: QueueOptions = {},
+  ) {}
+
+  call(request: ClientCallRequest): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      if (this.options.supersedeQueued) {
+        for (const dropped of this.queued.splice(0)) {
+          dropped.reject(Object.assign(
+            new Error("Superseded by a newer call"), { code: "REQUEST_SUPERSEDED" }));
+        }
+      }
+      const entry: Entry = { request, resolve, reject };
+      if (request.signal) {
+        entry.onAbort = () => {
+          const i = this.queued.indexOf(entry);
+          if (i >= 0) { // aborted while still queued: never starts
+            this.queued.splice(i, 1);
+            reject(Object.assign(new Error("Call aborted"), { code: "ABORTED" }));
+          }
+        };
+        request.signal.addEventListener("abort", entry.onAbort, { once: true });
+      }
+      this.queued.push(entry);
+      this.pump();
+    });
+  }
+
+  private pump(): void {
+    const max = this.options.maxConcurrent ?? 1;
+    while (this.running < max && this.queued.length > 0) {
+      const entry = this.options.order === "lifo" ? this.queued.pop()! : this.queued.shift()!;
+      this.running += 1;
+      this.client.call(entry.request)
+        .then(entry.resolve, entry.reject)
+        .finally(() => { this.running -= 1; this.pump(); });
+    }
+  }
+}
+```
+
+The policies we discussed are just configurations of this one queue:
+
+```ts
+const oneByOne = new CallQueue(client);                                        // serial, FIFO
+const pool     = new CallQueue(client, { maxConcurrent: 3 });                  // max 3 at a time
+const stack    = new CallQueue(client, { maxConcurrent: 1, order: "lifo" });   // last one first
+const latest   = new CallQueue(client, { maxConcurrent: 1, supersedeQueued: true }); // newest wins
+
+const result = await pool.call({ url: "http://127.0.0.1:3000/price", data: { sku: "A" } });
+```
+
+Variants worth knowing: add a per-entry `priority` and sort on `shift()`
+for priority queues; key the queue by route/tenant for per-key fairness;
+or use separate `NegotiationClient` instances when policies must be fully
+isolated (different services/plugins per policy).
+
+---
+
+## 10. Small patterns — cancellation and retry
+
+**Cancel one logical call** with an `AbortSignal` (queued calls in
+Example 9 honour it too; the server job expires on its own):
+
+```ts
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 5_000); // give up after 5s
+await client.call({ url, data, signal: controller.signal });
+```
+
+**Retry only coded, retryable failures** — never blind-retry a whole
+negotiation (it starts a brand-new job each attempt):
+
+```ts
+async function callWithRetry(request: ClientCallRequest, attempts = 3): Promise<unknown> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await client.call(request);
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (attempt >= attempts || !["TOO_MANY_JOBS", "ABORTED"].includes(code ?? "")) throw error;
+      await new Promise((r) => setTimeout(r, 250 * attempt));
+    }
+  }
+}
 ```

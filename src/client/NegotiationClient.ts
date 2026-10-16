@@ -21,7 +21,7 @@ import {
   type ProvideFor,
 } from "../common/negotiations.js";
 
-export { haltRequest, RequestHaltedError } from "../common/negotiations.js";
+export { haltRequest, RequestHaltedError, type ClientCallRequest } from "../common/negotiations.js";
 
 function responseHeaders(res: Response): Record<string, string> {
   const output: Record<string, string> = {};

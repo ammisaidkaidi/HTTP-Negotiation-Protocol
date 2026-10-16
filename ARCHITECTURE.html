@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>HTTP Negotiation Protocol — Full Architecture &amp; Flow Diagram</title>
+<style>
+body{font-family:Segoe UI,Arial,sans-serif;margin:32px;color:#1c2733;background:#fbfcfe}
+h1{font-size:24px} h2{margin-top:36px;border-bottom:2px solid #3b6fd4;padding-bottom:4px}
+svg{background:#fff;border:1px solid #d5dde8;border-radius:10px;max-width:100%;height:auto}
+table{border-collapse:collapse;width:100%;background:#fff}
+th,td{border:1px solid #d5dde8;padding:7px 9px;vertical-align:top;font-size:13px;text-align:left}
+th{background:#eef4ff} code{font-family:Consolas,monospace} .cls{margin:3px 0}
+.note{background:#fff7e6;border:1px solid #d9930d;border-radius:8px;padding:10px 14px}
+</style></head><body>
+<h1>HTTP Negotiation Protocol — Full Architecture &amp; Flow Diagram</h1>
+<p>Generated from the current source tree (v2.0.0 — core HTTP negotiation only; auth and database persistence removed).</p>
+
+<h2>1 · Module &amp; class architecture</h2>
+<svg viewBox="0 0 1180 430" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI,Arial" font-size="13">
+<defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#555"/></marker></defs>
+<style>.b{fill:#eef4ff;stroke:#3b6fd4;rx:8}.s{fill:#eafaf1;stroke:#1e9e6a}.w{fill:#fff7e6;stroke:#d9930d}.t{font-weight:600}</style>
+<rect class="b" x="20" y="30" width="230" height="120" rx="8"/><text class="t" x="35" y="55">NegotiationClient</text>
+<text x="35" y="78">use() · provide() · call()</text><text x="35" y="98">private send() — plugin chain</text>
+<text x="35" y="118">onRequest may HALT (REQUEST_HALTED)</text><text x="35" y="138">private executeAction() per action</text>
+<rect class="w" x="20" y="200" width="230" height="90" rx="8"/><text class="t" x="35" y="225">ClientPlugin chain</text>
+<text x="35" y="248">onRequest → onResponse / onError</text><text x="35" y="268">haltRequest() / return false / throw</text>
+<rect class="s" x="330" y="30" width="240" height="120" rx="8"/><text class="t" x="345" y="55">common/negotiations.ts</text>
+<text x="345" y="78">Wire types · NegotiationResponse</text><text x="345" y="98">ServerPlugin · handledResult()</text>
+<text x="345" y="118">defineContract · svc/act</text><text x="345" y="138">RequestHaltedError · errorPayload()</text>
+<rect class="s" x="330" y="200" width="240" height="90" rx="8"/><text class="t" x="345" y="225">common/webCrypto.ts</text>
+<text x="345" y="248">sha helpers · randomUuid()</text><text x="345" y="268">constantTimeEqual() (Web Crypto only)</text>
+<rect class="b" x="650" y="30" width="250" height="170" rx="8"/><text class="t" x="665" y="55">NegotiationServer</text>
+<text x="665" y="78">handle() · use() · plugin() · implement()</text><text x="665" y="98">dispatch() → handleInitial / handleResume</text>
+<text x="665" y="118">ask / asks() · run / runs() · callback()</text><text x="665" y="138">requestClientActions() suspends handler</text><text x="665" y="158">end() · respond() · finishWithError()</text><text x="665" y="178">jobs Map · expiry · close()</text>
+<rect class="w" x="650" y="240" width="250" height="90" rx="8"/><text class="t" x="665" y="265">ServerPlugin hooks</text>
+<text x="665" y="288">onCallStart may return handledResult()</text><text x="665" y="308">onRound · onCallEnd · onCallError</text>
+<rect class="b" x="960" y="30" width="200" height="120" rx="8"/><text class="t" x="975" y="55">Hosting (app-owned)</text>
+<text x="975" y="78">requestHandler() / attach()</text><text x="975" y="98">setPreHandler() raw HTTP</text><text x="975" y="118">Express / plain node:http</text><text x="975" y="138">NO server.listen()</text>
+<rect class="w" x="960" y="200" width="200" height="90" rx="8"/><text class="t" x="975" y="225">External provider</text>
+<text x="975" y="248">POST callbackUrl</text><text x="975" y="268">handleExternalCallback()</text>
+<line x1="250" y1="90" x2="330" y2="90" stroke="#555" marker-end="url(#a)"/><text x="258" y="80">shared types</text>
+<line x1="570" y1="90" x2="650" y2="90" stroke="#555" marker-end="url(#a)"/><text x="578" y="80">HTTP POST</text>
+<line x1="900" y1="90" x2="960" y2="90" stroke="#555" marker-end="url(#a)"/>
+<line x1="135" y1="150" x2="135" y2="200" stroke="#555" marker-end="url(#a)"/>
+<line x1="775" y1="200" x2="775" y2="240" stroke="#555" marker-end="url(#a)"/>
+<line x1="960" y1="245" x2="900" y2="160" stroke="#555" marker-end="url(#a)"/>
+<line x1="450" y1="200" x2="450" y2="150" stroke="#555" marker-end="url(#a)"/>
+<text x="20" y="350">Legend: blue = public classes · green = shared common modules · orange = plugins / external actors</text>
+<text x="20" y="375">Exports: http-negotiation-protocol/client → NegotiationClient, createClient, Client, haltRequest, RequestHaltedError, ClientCallRequest</text>
+<text x="20" y="398">Exports: http-negotiation-protocol/server → NegotiationServer, createServer, Server, handledResult, ServerPlugin* types</text>
+</svg>
+
+<h2>2 · Negotiation lifecycle flow (one logical call)</h2>
+<svg viewBox="0 0 1180 560" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI,Arial" font-size="13">
+<defs><marker id="a2" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#555"/></marker></defs>
+<style>.b{fill:#eef4ff;stroke:#3b6fd4}.s{fill:#eafaf1;stroke:#1e9e6a}.w{fill:#fff7e6;stroke:#d9930d}.t{font-weight:600}</style>
+<rect class="b" x="30" y="20" width="340" height="52" rx="8"/><text class="t" x="45" y="42">1 · client.call({url, data})</text><text x="45" y="62">per-call state is local (concurrency-safe)</text>
+<rect class="b" x="30" y="100" width="340" height="64" rx="8"/><text class="t" x="45" y="122">2 · send() → ClientPlugin.onRequest chain</text><text x="45" y="142">false / throw / haltRequest() ⇒ REQUEST_HALTED</text><text x="45" y="158">→ onError, call() rejects, no fetch</text>
+<rect class="s" x="450" y="100" width="340" height="64" rx="8"/><text class="t" x="465" y="122">3 · HTTP POST (initial)</text><text x="465" y="142">NegotiationServer.dispatch()</text><text x="465" y="158">{ params, data } · job created (maxJobs)</text>
+<rect class="w" x="450" y="192" width="340" height="64" rx="8"/><text class="t" x="465" y="214">4 · ServerPlugin.onCallStart chain</text><text x="465" y="234">handledResult(v) ⇒ skip handler, end(v)</text><text x="465" y="250">throw ⇒ finishWithError()</text>
+<rect class="s" x="450" y="284" width="340" height="76" rx="8"/><text class="t" x="465" y="306">5 · Route handler runs (suspended awaits)</text><text x="465" y="326">ask/asks() → client services · run/runs() → actions</text><text x="465" y="346">callback() → waits external POST · end()/return</text>
+<rect class="s" x="830" y="284" width="320" height="76" rx="8"/><text class="t" x="845" y="306">6 · Round: done:false + actions</text><text x="845" y="326">client executeAction() ×N (parallel)</text><text x="845" y="346">POST /__negotiation/resume (token rotates)</text>
+<rect class="b" x="450" y="392" width="340" height="64" rx="8"/><text class="t" x="465" y="414">7 · end(result): done:true response</text><text x="465" y="434">onCallEnd plugins · job removed</text><text x="465" y="450">client.call() resolves with result</text>
+<rect class="w" x="830" y="392" width="320" height="64" rx="8"/><text class="t" x="845" y="414">Guards</text><text x="845" y="434">requestTimeoutMs / round · jobTimeoutMs / job</text><text x="845" y="450">maxRounds (client) · close() rejects all</text>
+<line x1="200" y1="72" x2="200" y2="100" stroke="#555" marker-end="url(#a2)"/>
+<line x1="370" y1="132" x2="450" y2="132" stroke="#555" marker-end="url(#a2)"/>
+<line x1="620" y1="164" x2="620" y2="192" stroke="#555" marker-end="url(#a2)"/>
+<line x1="620" y1="256" x2="620" y2="284" stroke="#555" marker-end="url(#a2)"/>
+<line x1="790" y1="322" x2="830" y2="322" stroke="#555" marker-end="url(#a2)"/>
+<line x1="990" y1="360" x2="700" y2="392" stroke="#555" marker-end="url(#a2)"/>
+<line x1="990" y1="392" x2="990" y2="360" stroke="#555" marker-end="url(#a2)"/>
+<text x="855" y="380">loop 5↔6 until done</text>
+<text x="30" y="500">Errors: protocol errors return HTTP 200 {done:true, error} (client.call rejects with coded Error); transport/HTTP errors and halts go through ClientPlugin.onError.</text>
+<text x="30" y="525">Persistence: none — finished calls are not saved (RequestStore removed in v2.0.0); auth removed in v2.0.0.</text>
+</svg>
+
+<h2>3 · Complete inventory — every file, export, class (with methods) and function</h2>
+<table><tr><th>File</th><th>Exported symbols</th><th>Classes &amp; methods</th><th>Functions</th></tr>
+<tr><td><code>src/common/negotiations.ts</code></td><td>type <b>JsonRecord</b>, interface <b>ClientCallRequest</b>, interface <b>ServerRequest</b>, interface <b>ClientAction</b>, interface <b>ClientServiceRequest</b>, type <b>ActionResult</b>, interface <b>NegotiationResponse</b>, interface <b>HttpPluginRequest</b>, interface <b>HttpPluginResponse</b>, interface <b>ClientPlugin</b>, class <b>RequestHaltedError</b>, function <b>haltRequest</b>, interface <b>ServerPluginCall</b>, type <b>ServerPluginJob</b>, interface <b>ServerPluginCallRound</b>, type <b>ServerPluginRound</b>, interface <b>ServerPluginCallResult</b>, type <b>ServerPluginResult</b>, interface <b>ServerPluginCallError</b>, type <b>ServerPluginError</b>, interface <b>ServerPluginHandled</b>, function <b>handledResult</b>, interface <b>ServerPlugin</b>, type <b>ClientService</b>, type <b>ClientServices</b>, type <b>ServerAction</b>, type <b>RouteHandler</b>, interface <b>ServiceSpec</b>, interface <b>ActionSpec</b>, function <b>svc</b>, function <b>act</b>, const <b>defineService</b>, const <b>defineAction</b>, interface <b>ContractDefinition</b>, interface <b>EmptyContract</b>, function <b>defineContract</b>, type <b>AskFor</b>, type <b>RunFor</b>, type <b>ClientServiceImplementations</b>, type <b>ImplementFor</b>, type <b>ProvideFor</b>, type <b>ServerActionImplementations</b>, type <b>ClientServiceProxy</b>, type <b>ServerActionProxy</b>, type <b>AsksBuilder</b>, type <b>RunsBuilder</b>, function <b>toError</b>, function <b>errorPayload</b>, function <b>isObjectRecord</b></td><td><div class="cls"><b>class RequestHaltedError</b>: constructor()</div></td><td>—</td></tr><tr><td><code>src/common/webCrypto.ts</code></td><td>type <b>WebCryptoKey</b>, function <b>subtleCrypto</b>, function <b>arrayBuffer</b>, function <b>randomBytes</b>, function <b>randomUuid</b>, function <b>randomInt</b>, function <b>bytesToHex</b>, function <b>bytesToBase64Url</b>, function <b>base64UrlToBytes</b>, function <b>constantTimeEqual</b></td><td>—</td><td>webCrypto()</td></tr><tr><td><code>src/client/NegotiationClient.ts</code></td><td>interface <b>NegotiationClientOptions</b>, class <b>NegotiationClient</b>, function <b>createClient</b>, const <b>Client</b></td><td><div class="cls"><b>class NegotiationClient</b>: constructor(), use(), provide(), call(), executeAction(), send()</div></td><td>responseHeaders()</td></tr><tr><td><code>src/client/index.ts</code></td><td>—</td><td>—</td><td>—</td></tr><tr><td><code>src/server/NegotiationServer.ts</code></td><td>interface <b>NegotiationServerOptions</b>, class <b>ServerActionInvocation</b>, type <b>HttpFallbackHandler</b>, type <b>HttpPreHandler</b>, class <b>NegotiationServer</b>, function <b>createServer</b>, const <b>Server</b></td><td><div class="cls"><b>class ServerActionInvocation</b>: constructor(), execute()</div><div class="cls"><b>class NegotiationServer</b>: constructor(), reportError(), expireJob(), handle(), use(), plugin(), pluginCall(), runJobStartPlugins(), runPlugins(), runPluginsSafely(), ask(), run(), implement(), resolveServerActionName(), createPathProxy(), requestHandler(), handleRequest(), httpServer(), attach(), setPreHandler(), setFallbackHandler(), shutdownNegotiation(), close(), respond(), require(), requestService(), asks(), runs(), requestClientActions(), end(), getActiveCallCount(), getJobCount(), requireContext(), sendProtocolResponse(), sendJsonToCurrentResponse(), cleanupWhenFinished(), dispatch(), handleResume(), handleExternalCallback(), finishWithError()</div></td><td>deferred(), headerRecord(), tokenHash(), tokensMatch(), readJson(), sendJson(), waitForResponseEnd(), unwrapActionResult()</td></tr><tr><td><code>src/server/index.ts</code></td><td>—</td><td>—</td><td>—</td></tr><tr><td><code>demo/server.ts</code></td><td>—</td><td>—</td><td>logEvent(), sendJson(), state(), sendBrowserModule()</td></tr><tr><td><code>examples/demo.ts</code></td><td>—</td><td>—</td><td>main()</td></tr><tr><td><code>examples/express.ts</code></td><td>—</td><td>—</td><td>main()</td></tr>
+</table>
+
+<h2>4 · Supporting parts</h2>
+<div class="note">
+<p><b>demo/</b> — <code>demo/server.ts</code> hosts the web demo (page + negotiation routes, <code>/api/state</code>),
+transpiles the browser library on the fly; <code>demo/index.html</code> runs <code>NegotiationClient</code> in the browser.</p>
+<p><b>examples/</b> — <code>examples/demo.ts</code> (CLI delivery-estimate negotiation), <code>examples/express.ts</code> (Express hosting via <code>requestHandler()</code>/<code>attach()</code>).</p>
+<p><b>test/</b> — <code>test/scenarios.test.ts</code> (100 end-to-end scenarios A–I), <code>test/server-plugin.test.ts</code> (12 plugin tests), <code>test/client-plugin.test.ts</code> (3 halt/ordering tests) — 115 tests total.</p>
+<p><b>Build</b> — <code>src/tsconfig-client.json</code> / <code>src/tsconfig-server.json</code> (no-emit bundler configs) feed esbuild bundles; <code>tsconfig.build.json</code> emits <code>dist/</code> at repo root.</p>
+</div>
+</body></html>

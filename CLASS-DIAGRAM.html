@@ -1,0 +1,211 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<title>HTTP Negotiation Protocol — UML Class Diagram (classes &amp; types)</title>
+<style>body{font-family:Segoe UI,Arial,sans-serif;margin:32px;color:#1c2733;background:#fbfcfe}
+svg{background:#fff;border:1px solid #d5dde8;border-radius:10px;max-width:100%;height:auto}
+.note{background:#fff7e6;border:1px solid #d9930d;border-radius:8px;padding:10px 14px;max-width:900px}</style></head>
+<body><h1>HTTP Negotiation Protocol — UML Class Diagram (classes &amp; types)</h1>
+<p>All runtime classes, interfaces, type aliases and internal types of the project (v2.0.0). See also <code>ARCHITECTURE.html</code> for the flow diagram.</p>
+<svg viewBox="0 0 1330 1420" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI,Arial" font-size="12">
+<defs><marker id="arr" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#444"/></marker>
+<marker id="tri" markerWidth="12" markerHeight="12" refX="10" refY="5" orient="auto"><path d="M0,0 L11,5 L0,10 Z" fill="#fff" stroke="#444"/></marker></defs>
+<rect x="20" y="20" width="380" height="239" fill="#eef4ff" stroke="#333" stroke-width="1.2"/>
+<text x="210.0" y="35" text-anchor="middle" font-size="10" font-style="italic">class</text>
+<text x="210.0" y="50" text-anchor="middle" font-weight="700" font-size="13">NegotiationClient&lt;C&gt;</text>
+<line x1="20" y1="54" x2="400" y2="54" stroke="#333"/>
+<text x="28" y="69">- plugins: ClientPlugin[]</text>
+<text x="28" y="84">- services: Map&lt;string, ClientService&gt;</text>
+<text x="28" y="99">- serviceTimeoutMs: number = 60_000</text>
+<text x="28" y="114">- requestTimeoutMs: number = 120_000</text>
+<text x="28" y="129">- maxRounds: number = 100</text>
+<text x="28" y="144">- maxResponseBytes: number = 1_000_000</text>
+<text x="28" y="159">+ contract: C | undefined</text>
+<line x1="20" y1="166" x2="400" y2="166" stroke="#333"/>
+<text x="28" y="178">+ use(plugin | services): this</text>
+<text x="28" y="193">+ provide(services: ProvideFor&lt;C&gt;): this</text>
+<text x="28" y="208">+ call(request: ClientCallRequest): Promise&lt;unknown&gt;</text>
+<text x="28" y="223">- executeAction(action, signal?): Promise&lt;ActionResult&gt;</text>
+<text x="28" y="238">- send(url, body, headers, phase, signal?): Promise&lt;Response&gt;</text>
+<text x="28" y="253">+ createClient(): NegotiationClient (factory)</text>
+<rect x="460" y="20" width="470" height="509" fill="#eef4ff" stroke="#333" stroke-width="1.2"/>
+<text x="695.0" y="35" text-anchor="middle" font-size="10" font-style="italic">class</text>
+<text x="695.0" y="50" text-anchor="middle" font-weight="700" font-size="13">NegotiationServer&lt;C&gt;</text>
+<line x1="460" y1="54" x2="930" y2="54" stroke="#333"/>
+<text x="468" y="69">- storage: AsyncLocalStorage&lt;JobContext&gt;</text>
+<text x="468" y="84">- routes: Map&lt;string, RouteHandler&gt;</text>
+<text x="468" y="99">- actions: Map&lt;string, ServerAction&gt;</text>
+<text x="468" y="114">- plugins: ServerPlugin[]</text>
+<text x="468" y="129">- jobs: Map&lt;string, JobContext&gt;</text>
+<text x="468" y="144">- callbackPaths: Set&lt;string&gt;</text>
+<text x="468" y="159">- httpServerInstance?: HttpServer</text>
+<text x="468" y="174">- publicBaseUrl?: string</text>
+<text x="468" y="189">- maxBodyBytes / requestTimeoutMs = 120_000</text>
+<text x="468" y="204">- callbackTimeoutMs / jobTimeoutMs = 600_000</text>
+<text x="468" y="219">- maxJobs = 1000</text>
+<text x="468" y="234">- onError?(error, info)</text>
+<text x="468" y="249">+ contract: C | undefined</text>
+<line x1="460" y1="256" x2="930" y2="256" stroke="#333"/>
+<text x="468" y="268">+ handle(path, handler): this</text>
+<text x="468" y="283">+ use(actions): this   + plugin(p | p[]): this</text>
+<text x="468" y="298">+ implement(actions: ImplementFor&lt;C&gt;): this</text>
+<text x="468" y="313">+ get ask(): AskFor&lt;C&gt;   + get run(): RunFor&lt;C&gt;</text>
+<text x="468" y="328">+ asks(): AsksBuilder   + runs(): RunsBuilder</text>
+<text x="468" y="343">+ requestService(...) / require(...) (deprecated alias)</text>
+<text x="468" y="358">+ call(name, data): ServerActionInvocation&lt;T&gt;</text>
+<text x="468" y="373">+ callback(name, data, path?): Promise&lt;T&gt;</text>
+<text x="468" y="388">+ respond(request, result)   + end(result?): Promise&lt;void&gt;</text>
+<text x="468" y="403">+ requestHandler()   + attach(http): this   + close()</text>
+<text x="468" y="418">+ setPreHandler(h) / setFallbackHandler (alias)</text>
+<text x="468" y="433">+ getActiveCallCount() / getJobCount() (alias)</text>
+<text x="468" y="448">- dispatch() · handleResume() · handleExternalCallback()</text>
+<text x="468" y="463">- requestClientActions() · runJobStartPlugins()</text>
+<text x="468" y="478">- pluginCall() · runPlugins() · runPluginsSafely()</text>
+<text x="468" y="493">- createPathProxy() · resolveServerActionName()</text>
+<text x="468" y="508">- expireJob() · finishWithError() · reportError()</text>
+<text x="468" y="523">+ createServer(): NegotiationServer (factory)</text>
+<rect x="990" y="20" width="300" height="119" fill="#eef4ff" stroke="#333" stroke-width="1.2"/>
+<text x="1140.0" y="35" text-anchor="middle" font-size="10" font-style="italic">class · implements PromiseLike&lt;T&gt;</text>
+<text x="1140.0" y="50" text-anchor="middle" font-weight="700" font-size="13">ServerActionInvocation&lt;T&gt;</text>
+<line x1="990" y1="54" x2="1290" y2="54" stroke="#333"/>
+<text x="998" y="69">+ name: string</text>
+<text x="998" y="84">+ data: unknown</text>
+<text x="998" y="99">- run: (data) =&gt; Promise&lt;T&gt;</text>
+<line x1="990" y1="106" x2="1290" y2="106" stroke="#333"/>
+<text x="998" y="118">+ execute(dataOverride?): Promise&lt;T&gt;</text>
+<text x="998" y="133">+ then(...): PromiseLike&lt;...&gt;</text>
+<rect x="990" y="190" width="300" height="104" fill="#eef4ff" stroke="#333" stroke-width="1.2"/>
+<text x="1140.0" y="205" text-anchor="middle" font-size="10" font-style="italic">class · extends Error</text>
+<text x="1140.0" y="220" text-anchor="middle" font-weight="700" font-size="13">RequestHaltedError</text>
+<line x1="990" y1="224" x2="1290" y2="224" stroke="#333"/>
+<text x="998" y="239">+ code = &quot;REQUEST_HALTED&quot;</text>
+<text x="998" y="254">+ name = &quot;RequestHaltedError&quot;</text>
+<line x1="990" y1="261" x2="1290" y2="261" stroke="#333"/>
+<text x="998" y="273">+ constructor(message?)</text>
+<text x="998" y="288">haltRequest(message?): never  «function»</text>
+<rect x="990" y="330" width="300" height="214" fill="#eef4ff" stroke="#333" stroke-width="1.2"/>
+<text x="1140.0" y="345" text-anchor="middle" font-size="10" font-style="italic">interface · internal</text>
+<text x="1140.0" y="360" text-anchor="middle" font-weight="700" font-size="13">JobContext</text>
+<line x1="990" y1="364" x2="1290" y2="364" stroke="#333"/>
+<text x="998" y="379">+ jobId: string</text>
+<text x="998" y="394">+ resumeTokenHash: string (SHA-256)</text>
+<text x="998" y="409">+ request: ServerRequest</text>
+<text x="998" y="424">+ currentResponse: ServerResponse | null</text>
+<text x="998" y="439">+ round: number</text>
+<text x="998" y="454">+ result / resultSet / ended</text>
+<text x="998" y="469">+ pending?: PendingRound</text>
+<text x="998" y="484">+ latestOutgoing?: NegotiationResponse</text>
+<text x="998" y="499">+ externalCallbacks: Map&lt;string, ExternalCallback&gt;</text>
+<text x="998" y="514">+ receivedExternalCallbacks: Set&lt;string&gt;</text>
+<text x="998" y="529">+ startedAt: string</text>
+<text x="998" y="544">+ expiryTimer?: Timeout</text>
+<rect x="20" y="360" width="380" height="169" fill="#eef4ff" stroke="#333" stroke-width="1.2"/>
+<text x="210.0" y="375" text-anchor="middle" font-size="10" font-style="italic">interfaces · common/negotiations.ts</text>
+<text x="210.0" y="390" text-anchor="middle" font-weight="700" font-size="13">Wire / protocol types</text>
+<line x1="20" y1="394" x2="400" y2="394" stroke="#333"/>
+<text x="28" y="409">ClientCallRequest { url, params?, data?, headers?, signal?, maxRounds? }</text>
+<text x="28" y="424">ServerRequest { jobId, method, path, origin, params, data, headers }</text>
+<text x="28" y="439">ClientAction { name, data, callbackID }  (correlation ID)</text>
+<text x="28" y="454">ClientServiceRequest { name, data?, fallback? }</text>
+<text x="28" y="469">ActionResult = { callbackID, ok:true, result }</text>
+<text x="28" y="484">             | { callbackID, ok:false, error{code,message} }</text>
+<text x="28" y="499">NegotiationResponse { protocol:1, jobId, round, done,</text>
+<text x="28" y="514">   result?, error?, actions: ClientAction[], resumeUrl?, resumeToken? }</text>
+<text x="28" y="529">JsonRecord = Record&lt;string, unknown&gt;</text>
+<rect x="20" y="640" width="380" height="154" fill="#eef4ff" stroke="#333" stroke-width="1.2"/>
+<text x="210.0" y="655" text-anchor="middle" font-size="10" font-style="italic">interfaces</text>
+<text x="210.0" y="670" text-anchor="middle" font-weight="700" font-size="13">Client plugin types</text>
+<line x1="20" y1="674" x2="400" y2="674" stroke="#333"/>
+<text x="28" y="689">HttpPluginRequest { url, method:&quot;POST&quot;, headers, body, phase }</text>
+<text x="28" y="704">HttpPluginResponse { url, status, headers, phase }</text>
+<text x="28" y="719">ClientPlugin {</text>
+<text x="28" y="734">  onRequest?(req): void|false|HttpPluginRequest|Promise&lt;...&gt;</text>
+<text x="28" y="749">  onResponse?(body, res): void|unknown|Promise&lt;...&gt;</text>
+<text x="28" y="764">  onError?(error, req): void|Promise&lt;void&gt; }</text>
+<text x="28" y="779">NegotiationClientOptions { serviceTimeoutMs?,</text>
+<text x="28" y="794">  requestTimeoutMs?, maxRounds?, maxResponseBytes?, contract? }</text>
+<rect x="460" y="700" width="470" height="199" fill="#eef4ff" stroke="#333" stroke-width="1.2"/>
+<text x="695.0" y="715" text-anchor="middle" font-size="10" font-style="italic">interfaces</text>
+<text x="695.0" y="730" text-anchor="middle" font-weight="700" font-size="13">Server plugin types</text>
+<line x1="460" y1="734" x2="930" y2="734" stroke="#333"/>
+<text x="468" y="749">ServerPluginCall { jobId, path, method, origin, round, startedAt, request }</text>
+<text x="468" y="764">ServerPluginCallRound extends ServerPluginCall { actions: ClientAction[] }</text>
+<text x="468" y="779">ServerPluginCallResult extends ServerPluginCall { result: unknown }</text>
+<text x="468" y="794">ServerPluginCallError extends ServerPluginCall { error: Error }</text>
+<text x="468" y="809">ServerPluginHandled { handled: true, result?: unknown }</text>
+<text x="468" y="824">  ← handledResult(result?) «function» creates it</text>
+<text x="468" y="839">ServerPlugin { name?, onCallStart?, onRound?, onCallEnd?, onCallError?,</text>
+<text x="468" y="854">  onNegotiationStart/End/Error? (deprecated aliases),</text>
+<text x="468" y="869">  onJobStart/End/Error? (deprecated aliases) }</text>
+<text x="468" y="884">Aliases: ServerPluginJob = ServerPluginCall, ServerPluginRound,</text>
+<text x="468" y="899">  ServerPluginResult, ServerPluginError (deprecated type aliases)</text>
+<rect x="990" y="700" width="300" height="169" fill="#eef4ff" stroke="#333" stroke-width="1.2"/>
+<text x="1140.0" y="715" text-anchor="middle" font-size="10" font-style="italic">interfaces · internal</text>
+<text x="1140.0" y="730" text-anchor="middle" font-weight="700" font-size="13">Server options &amp; internals</text>
+<line x1="990" y1="734" x2="1290" y2="734" stroke="#333"/>
+<text x="998" y="749">NegotiationServerOptions { publicBaseUrl?, callbackPath?,</text>
+<text x="998" y="764">  maxBodyBytes?, requestTimeoutMs?, callbackTimeoutMs?,</text>
+<text x="998" y="779">  maxJobs?, jobTimeoutMs?, onError?, contract? }</text>
+<text x="998" y="794">PendingRound { round, expected: Set&lt;string&gt;, resolve, reject }</text>
+<text x="998" y="809">ExternalCallback { tokenHash, result: Deferred&lt;unknown&gt;, settled }</text>
+<text x="998" y="824">Deferred&lt;T&gt; { promise, resolve(value), reject(error) }</text>
+<text x="998" y="839">AskEntry / RunEntry { name, data?, fallback?, hasFallback }</text>
+<text x="998" y="854">HttpFallbackHandler = (req,res)=&gt;boolean|Promise&lt;boolean&gt;</text>
+<text x="998" y="869">HttpPreHandler = HttpFallbackHandler (canonical alias)</text>
+<rect x="20" y="900" width="470" height="199" fill="#eef4ff" stroke="#333" stroke-width="1.2"/>
+<text x="255.0" y="915" text-anchor="middle" font-size="10" font-style="italic">interfaces &amp; type helpers</text>
+<text x="255.0" y="930" text-anchor="middle" font-weight="700" font-size="13">Contract-first typed API</text>
+<line x1="20" y1="934" x2="490" y2="934" stroke="#333"/>
+<text x="28" y="949">ServiceSpec&lt;TData, TResult&gt; { kind:&quot;client-service&quot;, __data?, __result? }</text>
+<text x="28" y="964">ActionSpec&lt;TData, TResult&gt; { kind:&quot;server-action&quot;, __data?, __result? }</text>
+<text x="28" y="979">svc() / defineService · act() / defineAction «functions»</text>
+<text x="28" y="994">ContractDefinition { client?: Record&lt;string, ServiceSpec&gt;,</text>
+<text x="28" y="1009">                     server?: Record&lt;string, ActionSpec&gt; }</text>
+<text x="28" y="1024">EmptyContract { client: Record&lt;never,never&gt;, server: Record&lt;never,never&gt; }</text>
+<text x="28" y="1039">defineContract(contract): C «function»</text>
+<text x="28" y="1054">AskFor&lt;C&gt; · RunFor&lt;C&gt; · ProvideFor&lt;C&gt; · ImplementFor&lt;C&gt;</text>
+<text x="28" y="1069">ClientServiceImplementations&lt;C&gt; · ServerActionImplementations&lt;C&gt;</text>
+<text x="28" y="1084">ClientServiceProxy = any · ServerActionProxy = any</text>
+<text x="28" y="1099">AsksBuilder = any · RunsBuilder = any (magic proxies)</text>
+<rect x="540" y="1010" width="390" height="124" fill="#eef4ff" stroke="#333" stroke-width="1.2"/>
+<text x="735.0" y="1025" text-anchor="middle" font-size="10" font-style="italic">type aliases</text>
+<text x="735.0" y="1040" text-anchor="middle" font-weight="700" font-size="13">Function types</text>
+<line x1="540" y1="1044" x2="930" y2="1044" stroke="#333"/>
+<text x="548" y="1059">ClientService = (data:any) =&gt; unknown | Promise&lt;unknown&gt;</text>
+<text x="548" y="1074">ClientServices = Record&lt;string, ClientService&gt;</text>
+<text x="548" y="1089">ServerAction = (data:any, request?: ServerRequest)</text>
+<text x="548" y="1104">              =&gt; unknown | Promise&lt;unknown&gt;</text>
+<text x="548" y="1119">RouteHandler = (request: ServerRequest)</text>
+<text x="548" y="1134">              =&gt; unknown | Promise&lt;unknown&gt;</text>
+<rect x="990" y="1010" width="300" height="139" fill="#eef4ff" stroke="#333" stroke-width="1.2"/>
+<text x="1140.0" y="1025" text-anchor="middle" font-size="10" font-style="italic">types &amp; functions · no node:crypto</text>
+<text x="1140.0" y="1040" text-anchor="middle" font-weight="700" font-size="13">webCrypto.ts</text>
+<line x1="990" y1="1044" x2="1290" y2="1044" stroke="#333"/>
+<text x="998" y="1059">WebCryptoKey = object</text>
+<text x="998" y="1074">SubtleCryptoLike / WebCryptoLike (structural)</text>
+<text x="998" y="1089">subtleCrypto() · arrayBuffer()</text>
+<text x="998" y="1104">randomBytes() · randomUuid() · randomInt()</text>
+<text x="998" y="1119">bytesToHex() · bytesToBase64Url() · base64UrlToBytes()</text>
+<text x="998" y="1134">constantTimeEqual(a, b): boolean</text>
+<text x="998" y="1149">sha256Hex(text) — used for token hashing</text>
+<rect x="990" y="300" width="300" height="22" fill="#fff" stroke="#333"/><text x="1140" y="315" text-anchor="middle">Error (built-in)</text>
+<line x1="1140" y1="294" x2="1140" y2="300" stroke="#444" stroke-width="1.2" marker-end="url(#tri)" /><text x="1144.0" y="293.0" font-size="11">extends</text>
+<line x1="695" y1="700" x2="695" y2="686" stroke="#444" stroke-width="1.2" marker-end="url(#tri)" />
+<text x="705" y="684" font-size="11">Round/Result/Error extend ServerPluginCall</text>
+<line x1="400" y1="120" x2="400" y2="640" stroke="#444" stroke-width="1.2" marker-end="url(#arr)" stroke-dasharray="5,3"/><text x="404.0" y="376.0" font-size="11">uses 0..* ClientPlugin</text>
+<line x1="210" y1="259" x2="210.0" y2="360" stroke="#444" stroke-width="1.2" marker-end="url(#arr)" stroke-dasharray="5,3"/><text x="214.0" y="305.5" font-size="11">call(ClientCallRequest) · NegotiationResponse</text>
+<line x1="930" y1="200" x2="990" y2="380" stroke="#444" stroke-width="1.2" marker-end="url(#arr)" stroke-dasharray="5,3"/><text x="964.0" y="286.0" font-size="11">jobs: Map «composition» 0..* JobContext</text>
+<line x1="660" y1="529" x2="695.0" y2="700" stroke="#444" stroke-width="1.2" marker-end="url(#arr)" stroke-dasharray="5,3"/><text x="681.5" y="610.5" font-size="11">plugins 0..* ServerPlugin · handledResult()</text>
+<line x1="930" y1="120" x2="990" y2="60" stroke="#444" stroke-width="1.2" marker-end="url(#arr)" stroke-dasharray="5,3"/><text x="964.0" y="86.0" font-size="11">call() returns</text>
+<line x1="1140" y1="139" x2="1140" y2="153" stroke="#444" stroke-width="1.2" marker-end="url(#tri)" />
+<text x="1150" y="155" font-size="11">implements PromiseLike&lt;T&gt;</text>
+<line x1="210.0" y1="259" x2="450" y2="940" stroke="#444" stroke-width="1.2" marker-end="url(#arr)" stroke-dasharray="5,3"/><text x="334.0" y="595.5" font-size="11">generic C extends ContractDefinition</text>
+<line x1="1140" y1="544" x2="1140.0" y2="700" stroke="#444" stroke-width="1.2" marker-end="url(#arr)" stroke-dasharray="5,3"/><text x="1144.0" y="618.0" font-size="11">pending / callbacks</text>
+<text x="20" y="1380" font-size="12">Visibility: + public · - private. «function» = standalone exported function. Dashed arrows = association/usage; hollow triangle = inheritance/implementation.</text>
+<text x="20" y="1402" font-size="12">Deprecated-but-working aliases are kept on ServerPlugin (onNegotiation*/onJob*) and NegotiationServer (require, getJobCount, setFallbackHandler).</text>
+</svg>
+<div class="note"><p><b>Reading notes:</b> <code>NegotiationClient</code> and <code>NegotiationServer</code> are generic over a contract
+<code>C extends ContractDefinition</code>. <code>ServerActionInvocation</code> is the lazy thenable returned by
+<code>server.call()</code>. <code>JobContext</code>, <code>PendingRound</code>, <code>ExternalCallback</code>,
+<code>Deferred</code>, <code>AskEntry</code>/<code>RunEntry</code> are internal (not exported).
+<code>AsksBuilder</code>/<code>RunsBuilder</code> and the proxy types are intentionally <code>any</code>-typed magic proxies,
+typed precisely only when a contract is supplied (via <code>AskFor</code>/<code>RunFor</code>).</p></div>
+</body></html>
