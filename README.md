@@ -293,6 +293,24 @@ mirror middleware: throwing from `onCallStart`/`onRound` **fails the job**
 option and never changes the outcome. The client has the symmetric HTTP
 plugin API (`client.use({ onRequest, onResponse, onError })`).
 
+**Errors seen by clients.** Only errors marked as safe reach a client with
+their text and code: a `PublicError` you throw on purpose, and the library's
+own protocol errors (for example `JOB_EXPIRED`, `SERVER_SHUTDOWN`, timeouts,
+body limits, and auth failures). Any other error thrown from a route, action,
+or plugin reaches the client as `INTERNAL_ERROR` with a generic message, so
+database errors, hosts, and credentials are never sent. The original error is
+passed to `onCallError`; if no error hook is registered it is logged with
+`console.error`.
+
+```ts
+import { PublicError } from "http-negotiation-protocol/server";
+
+server.handle("/seats/reserve", async ({ data }) => {
+  if (!seatFree(data.seat)) throw new PublicError("Seat is already taken", "SEAT_TAKEN");
+  return reserve(data.seat);
+});
+```
+
 **Ask privacy:** plugins cannot observe or intercept asks/responseAsks.
 `onRound` never carries the asked actions; client plugins receive resume
 requests with the results body redacted (they may still time, header, or

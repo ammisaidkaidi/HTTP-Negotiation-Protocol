@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { createClient, NegotiationClient } from "../src/client/index.js";
-import { defineContract, svc, type ClientAction } from "../src/common/negotiations.js";
+import { defineContract, PublicError, svc, type ClientAction } from "../src/common/negotiations.js";
 import { createServer, NegotiationServer } from "../src/server/index.js";
 
 // Each test below reproduces one defect found in the src/ review and guards
@@ -437,7 +437,7 @@ test("regression: contract checks reject prototype names such as constructor", a
 
   const client = createClient(contract);
   try {
-    await assert.rejects(client.call({ url: `http://127.0.0.1:${port}/job` }), /not defined in the contract/);
+    await assert.rejects(client.call({ url: `http://127.0.0.1:${port}/job` }), (error: unknown) => (error as { code?: string }).code === "INTERNAL_ERROR");
   } finally {
     await server.close();
   }
@@ -710,4 +710,49 @@ test("regression: use() rejects a plugin object that also carries services", () 
   );
   // A plugin with plain (non-function) metadata is still a valid plugin.
   assert.doesNotThrow(() => client.use({ name: "audit", onRequest: () => undefined } as never));
+});
+
+// ---------------------------------------------------------------------------
+// 24. Any error thrown from a route was sent to the client with its raw message,
+//     so database errors, hosts, paths, and credentials could reach callers.
+// ---------------------------------------------------------------------------
+test("regression: unexpected errors reach clients as INTERNAL_ERROR; details go to onCallError", async () => {
+  const seen: string[] = [];
+  const server = new NegotiationServer();
+  server.plugin({
+    onCallError: ({ error }) => {
+      seen.push((error as Error).message);
+    },
+  });
+  server.handle("/job", async () => {
+    throw Object.assign(new Error("connect ECONNREFUSED 10.0.0.5:5432 password=hunter2"), { code: "ECONNREFUSED" });
+  });
+
+  await withServer(server, async (baseUrl) => {
+    const error = await new NegotiationClient()
+      .call({ url: `${baseUrl}/job` })
+      .then(() => null, (failure: Error & { code?: string }) => failure);
+    assert.equal(error?.code, "INTERNAL_ERROR");
+    assert.doesNotMatch(error?.message ?? "", /hunter2|10\.0\.0\.5|ECONNREFUSED/);
+  });
+  assert.match(seen[0] ?? "", /password=hunter2/);
+});
+
+// ---------------------------------------------------------------------------
+// 25. Positive control: an error the application marks as public keeps its
+//     message and code when it reaches the client.
+// ---------------------------------------------------------------------------
+test("regression: PublicError messages and codes reach the client", async () => {
+  const server = new NegotiationServer();
+  server.handle("/job", async () => {
+    throw new PublicError("Seat 12A is already taken", "SEAT_TAKEN");
+  });
+
+  await withServer(server, async (baseUrl) => {
+    const error = await new NegotiationClient()
+      .call({ url: `${baseUrl}/job` })
+      .then(() => null, (failure: Error & { code?: string }) => failure);
+    assert.equal(error?.code, "SEAT_TAKEN");
+    assert.equal(error?.message, "Seat 12A is already taken");
+  });
 });

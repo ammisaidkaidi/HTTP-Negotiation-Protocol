@@ -7,8 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `PublicError`: throw it to show a message and code to the client. The
+  library's own protocol errors (job expiry, shutdown, timeouts, body limits,
+  auth failures) are public too.
+
 ### Changed (breaking)
 
+- Errors thrown from routes, actions, and plugins are no longer sent to the
+  client with their message. Clients receive `INTERNAL_ERROR` with a generic
+  message; the original error goes to `onCallError`, or is logged with
+  `console.error` when no error hook is registered. Use `PublicError` for
+  errors that clients should see. Errors from client services that a handler
+  passes on keep their message, because they came from the caller.
 - Callback URLs without `publicBaseUrl` are only built for loopback hosts
   (`localhost`, `127.0.0.1`, `[::1]`). Any other `Host` header now makes
   `callback()` reject with an error that names `publicBaseUrl`. Set

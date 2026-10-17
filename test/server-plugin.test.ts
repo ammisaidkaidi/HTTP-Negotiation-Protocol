@@ -80,7 +80,7 @@ test("server plugins accept an array and onCallError observes handler failures",
 
   await withServer(server, async (baseUrl) => {
     const client = new NegotiationClient();
-    await assert.rejects(client.call({ url: `${baseUrl}/boom`, data: {} }), /boom/);
+    await assert.rejects(client.call({ url: `${baseUrl}/boom`, data: {} }), (error: unknown) => (error as { code?: string }).code === "INTERNAL_ERROR");
   });
 
   assert.deepEqual(events, ["start:/boom:round0", "error:boom"]);
@@ -103,7 +103,7 @@ test("a throwing onCallStart fails the job and still fires onCallError", async (
     const client = new NegotiationClient();
     await assert.rejects(
       client.call({ url: `${baseUrl}/example`, data: {} }),
-      /plugin refused the job/,
+      (error: unknown) => (error as { code?: string }).code === "INTERNAL_ERROR",
     );
   });
 
@@ -198,7 +198,7 @@ test("deprecated onJob* aliases still work (start short-circuit, end, error)", a
   await withServer(server, async (baseUrl) => {
     const client = new NegotiationClient();
     assert.deepEqual(await client.call({ url: `${baseUrl}/cached`, data: {} }), { legacy: true });
-    await assert.rejects(client.call({ url: `${baseUrl}/fail`, data: {} }), /legacy boom/);
+    await assert.rejects(client.call({ url: `${baseUrl}/fail`, data: {} }), (error: unknown) => (error as { code?: string }).code === "INTERNAL_ERROR");
   });
 
   assert.deepEqual(events, [
@@ -221,7 +221,7 @@ test("deprecated onNegotiation* aliases still work", async () => {
   await withServer(server, async (baseUrl) => {
     const client = new NegotiationClient();
     await client.call({ url: `${baseUrl}/ok`, data: {} });
-    await assert.rejects(client.call({ url: `${baseUrl}/fail`, data: {} }), /neg boom/);
+    await assert.rejects(client.call({ url: `${baseUrl}/fail`, data: {} }), (error: unknown) => (error as { code?: string }).code === "INTERNAL_ERROR");
   });
 
   assert.deepEqual(events, ["neg-start", "neg-end", "neg-start", "neg-error"]);

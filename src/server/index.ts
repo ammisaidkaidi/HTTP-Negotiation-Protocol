@@ -1,5 +1,5 @@
 export * from "./NegotiationServer.js";
-export { handledResult } from "../common/negotiations.js";
+export { handledResult, PublicError } from "../common/negotiations.js";
 export type {
   ServerPlugin,
   ServerPluginCall,

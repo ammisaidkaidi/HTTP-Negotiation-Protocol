@@ -387,6 +387,27 @@ export function toError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
 }
 
+/**
+ * An error whose message and code may be shown to the client. Any other error
+ * thrown from a route, action, or handler reaches the client as a generic
+ * INTERNAL_ERROR; its details are still passed to `onCallError` plugin hooks.
+ */
+export class PublicError extends Error {
+  readonly code: string;
+
+  constructor(message: string, code = "APPLICATION_ERROR") {
+    super(message);
+    this.name = "PublicError";
+    this.code = code;
+  }
+}
+
+/** @internal Wire shape for an error sent to a client: only PublicError keeps its text. */
+export function publicErrorPayload(value: unknown): { code: string; message: string } {
+  if (value instanceof PublicError) return { code: value.code, message: value.message };
+  return { code: "INTERNAL_ERROR", message: "An unexpected error occurred" };
+}
+
 /** @internal Shared wire error shape (not part of the public API). */
 export function errorPayload(value: unknown): { code: string; message: string } {
   const error = toError(value);

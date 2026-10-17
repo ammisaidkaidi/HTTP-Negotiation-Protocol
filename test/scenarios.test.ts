@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import test from "node:test";
 import express from "express";
+import { PublicError } from "../src/common/negotiations.js";
 import {
   createClient,
   haltRequest,
@@ -188,7 +189,7 @@ function buildServer(ctx: Ctx, server: NegotiationServer): void {
   server.handle("/count", async () => server.run.counter.next({}));
   server.handle("/fail-handler", async () => { throw new Error("handler exploded"); });
   server.handle("/fail-coded", async () => {
-    throw Object.assign(new Error("teapot"), { code: "TEAPOT" });
+    throw new PublicError("teapot", "TEAPOT");
   });
   server.handle("/unknown-service", async () => server.ask.no.suchService());
   server.handle("/unknown-action", async () => server.run.no.suchAction());
@@ -379,7 +380,7 @@ add("C runs per-call fallback recovers a failing action", () => withRig(async (r
   assert.deepEqual(await call(rig, "/runs-fallback"), ["recovered", 2]);
 }));
 add("C runs without fallback rejects on failing action", () => withRig(async (rig) => {
-  await assert.rejects(call(rig, "/runs-no-fallback"), /action exploded/);
+  await assert.rejects(call(rig, "/runs-no-fallback"), (error: unknown) => (error as { code?: string }).code === "INTERNAL_ERROR");
 }));
 add("C single require() array honours descriptor fallback", () => withRig(async (rig) => {
   assert.deepEqual(await call(rig, "/single-fallback"), ["fb"]);
@@ -436,7 +437,7 @@ add("D callback times out when the provider never calls back", () => withRig(asy
   await assert.rejects(call(rig, "/quote-never"), /timed out/);
 }, { requestTimeoutMs: 150 }));
 add("D failing callback action fails the job", () => withRig(async (rig) => {
-  await assert.rejects(call(rig, "/quote-fail"), /carrier down/);
+  await assert.rejects(call(rig, "/quote-fail"), (error: unknown) => (error as { code?: string }).code === "INTERNAL_ERROR");
 }));
 add("D createCallback with a function observes the payload", () => withRig(async (rig) => {
   const result = await call(rig, "/quote-fn") as { quoteId: string };
@@ -586,16 +587,16 @@ add("F onRound fires per round (no ask details exposed to plugins)", () => withR
 add("F onCallError fires when the handler throws", () => withRig(async (rig) => {
   const errors: string[] = [];
   rig.server.plugin({ onCallError: (job) => { errors.push(job.error.message); } });
-  await assert.rejects(call(rig, "/fail-handler"), /handler exploded/);
+  await assert.rejects(call(rig, "/fail-handler"), (error: unknown) => (error as { code?: string }).code === "INTERNAL_ERROR");
   assert.deepEqual(errors, ["handler exploded"]);
 }));
 add("F throwing onCallStart fails the job before the handler runs", () => withRig(async (rig) => {
   rig.server.plugin({ onCallStart: () => { throw new Error("job refused"); } });
-  await assert.rejects(call(rig, "/echo", {}), /job refused/);
+  await assert.rejects(call(rig, "/echo", {}), (error: unknown) => (error as { code?: string }).code === "INTERNAL_ERROR");
 }));
 add("F throwing onRound fails the job before the client service runs", () => withRig(async (rig) => {
   rig.server.plugin({ onRound: () => { throw new Error("round refused"); } });
-  await assert.rejects(call(rig, "/ask-two"), /round refused/);
+  await assert.rejects(call(rig, "/ask-two"), (error: unknown) => (error as { code?: string }).code === "INTERNAL_ERROR");
   assert.equal(rig.ctx.serviceCalls.getName ?? 0, 0);
 }));
 add("F throwing onCallEnd is reported via onError and result is unaffected", async () => {
@@ -632,7 +633,7 @@ add("F throwing onCallError is reported and the original error reaches the clien
   if (!address || typeof address === "string") throw new Error("bind failed");
   try {
     const client = new NegotiationClient();
-    await assert.rejects(client.call({ url: `http://127.0.0.1:${address.port}/x`, data: {} }), /handler exploded/);
+    await assert.rejects(client.call({ url: `http://127.0.0.1:${address.port}/x`, data: {} }), (error: unknown) => (error as { code?: string }).code === "INTERNAL_ERROR");
     assert.deepEqual(reported, ["plugin:onCallError:error-observer exploded"]);
   } finally {
     await server.close();
@@ -684,7 +685,7 @@ add("G unknown client service fails the job", () => withRig(async (rig) => {
   await assert.rejects(call(rig, "/unknown-service"), /no\.suchService|Unknown|not/i);
 }));
 add("G unknown server action fails the job", () => withRig(async (rig) => {
-  await assert.rejects(call(rig, "/unknown-action"), /Unknown server action/);
+  await assert.rejects(call(rig, "/unknown-action"), (error: unknown) => (error as { code?: string }).code === "INTERNAL_ERROR");
 }));
 add("G failing client service without fallback surfaces its message", () => withRig(async (rig) => {
   await assert.rejects(call(rig, "/asks-no-fallback"), /service exploded/);
@@ -811,7 +812,7 @@ add("H contract server rejects asking for a service outside the contract", async
     client.provide({ getName: async () => "Alex" });
     await assert.rejects(
       client.call({ url: `http://127.0.0.1:${address.port}/x`, data: {} }),
-      /not defined in the contract/,
+      (error: unknown) => (error as { code?: string }).code === "INTERNAL_ERROR",
     );
   } finally {
     await server.close();

@@ -8,13 +8,13 @@
  * and lets production code inject a synchronized/test clock.
  */
 
-export class AuthError extends Error {
-  readonly code: string;
+import { PublicError } from "../src/common/negotiations.js";
 
+/** Auth failures are safe to show the client, so they are PublicErrors with their codes. */
+export class AuthError extends PublicError {
   constructor(code: string, message: string) {
-    super(message);
+    super(message, code);
     this.name = "AuthError";
-    this.code = code;
   }
 }
 

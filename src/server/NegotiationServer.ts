@@ -11,7 +11,8 @@ import {
 } from "node:http";
 import { URL } from "node:url";
 import {
-  errorPayload,
+  PublicError,
+  publicErrorPayload,
   isObjectRecord,
   toError,
   type ActionResult,
@@ -94,17 +95,13 @@ async function readJson(req: IncomingMessage, maxBytes: number): Promise<any> {
     if (typeof preparsed === "string" || Buffer.isBuffer(preparsed)) {
       const text = preparsed.toString();
       if (Buffer.byteLength(text) > maxBytes) {
-        const error = new Error(`Request body exceeds ${maxBytes} bytes`);
-        (error as Error & { code: string }).code = "BODY_TOO_LARGE";
-        throw error;
+        throw new PublicError(`Request body exceeds ${maxBytes} bytes`, "BODY_TOO_LARGE");
       }
       if (!text) return {};
       try {
         return JSON.parse(text);
       } catch {
-        const error = new Error("Request body must be valid JSON");
-        (error as Error & { code: string }).code = "INVALID_JSON";
-        throw error;
+        throw new PublicError("Request body must be valid JSON", "INVALID_JSON");
       }
     }
     return preparsed;
@@ -115,9 +112,7 @@ async function readJson(req: IncomingMessage, maxBytes: number): Promise<any> {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     length += buffer.length;
     if (length > maxBytes) {
-      const error = new Error(`Request body exceeds ${maxBytes} bytes`);
-      (error as Error & { code: string }).code = "BODY_TOO_LARGE";
-      throw error;
+      throw new PublicError(`Request body exceeds ${maxBytes} bytes`, "BODY_TOO_LARGE");
     }
     chunks.push(buffer);
   }
@@ -125,9 +120,7 @@ async function readJson(req: IncomingMessage, maxBytes: number): Promise<any> {
   try {
     return JSON.parse(Buffer.concat(chunks).toString("utf8"));
   } catch {
-    const error = new Error("Request body must be valid JSON");
-    (error as Error & { code: string }).code = "INVALID_JSON";
-    throw error;
+    throw new PublicError("Request body must be valid JSON", "INVALID_JSON");
   }
 }
 
@@ -167,9 +160,7 @@ function assignNamed(results: unknown[], key: string, value: unknown): void {
 
 function unwrapActionResult(item: ActionResult): unknown {
   if (item.ok) return item.result;
-  const error = new Error(item.error.message) as Error & { code: string };
-  error.code = item.error.code;
-  throw error;
+  throw new PublicError(item.error.message, item.error.code);
 }
 
 interface PendingRound {
@@ -311,10 +302,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
 
   private expireJob(context: JobContext): void {
     if (context.ended) return;
-    const error = Object.assign(
-      new Error(`Negotiation job ${context.jobId} exceeded its maximum lifetime`),
-      { code: "JOB_EXPIRED" },
-    );
+    const error = new PublicError(`Negotiation job ${context.jobId} exceeded its maximum lifetime`, "JOB_EXPIRED");
     // Record the failure first: no later round, and no result from the handler, may revive the job.
     context.failure = error;
     if (context.pending) {
@@ -539,7 +527,8 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     try {
       await this.dispatch(req, res);
     } catch (error) {
-      sendJson(res, 500, { ok: false, error: errorPayload(error) });
+      if (!(error instanceof PublicError)) console.error("[negotiation] unexpected error while handling a request:", error);
+      sendJson(res, 500, { ok: false, error: publicErrorPayload(error) });
     }
   }
 
@@ -611,9 +600,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   private shutdownNegotiation(): Promise<void> {
     this.shutdownPromise ??= (async () => {
       // Fail every suspended job first so handlers unwind instead of hanging.
-      const shutdownError = Object.assign(new Error("Negotiation server is shutting down"), {
-        code: "SERVER_SHUTDOWN",
-      });
+      const shutdownError = new PublicError("Negotiation server is shutting down", "SERVER_SHUTDOWN");
       for (const context of this.jobs.values()) {
         if (context.expiryTimer) clearTimeout(context.expiryTimer);
         context.failure = shutdownError;
@@ -919,7 +906,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     const timeout = setTimeout(() => {
       if (context.pending?.round === round) {
         context.pending = undefined;
-        wait.reject(new Error(`Negotiation round ${round} timed out`));
+        wait.reject(new PublicError(`Negotiation round ${round} timed out`, "ROUND_TIMEOUT"));
       }
     }, this.requestTimeoutMs);
     try {
@@ -1018,7 +1005,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       const entry = context.externalCallbacks.get(callbackID);
       if (entry && !entry.settled) {
         entry.settled = true;
-        entry.result.reject(new Error(`External callback ${callbackID} timed out`));
+        entry.result.reject(new PublicError(`External callback ${callbackID} timed out`, "CALLBACK_TIMEOUT"));
       }
     }, this.callbackTimeoutMs);
 
@@ -1102,6 +1089,16 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     this.sendJsonToCurrentResponse(context, response);
   }
 
+  /**
+   * Unexpected errors are never shown to clients, so log them here unless an
+   * error hook is registered to receive them.
+   */
+  private reportUnexpected(error: unknown, where: string): void {
+    if (error instanceof PublicError) return;
+    const hooked = this.plugins.some((plugin) => plugin.onCallError || plugin.onNegotiationError || plugin.onJobError);
+    if (!hooked) console.error(`[negotiation] unexpected error ${where}:`, error);
+  }
+
   private hasOpenResponse(context: JobContext): boolean {
     const response = context.currentResponse;
     return Boolean(response && !response.writableEnded && !response.destroyed);
@@ -1178,7 +1175,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     try {
       body = await readJson(req, this.maxBodyBytes);
     } catch (error) {
-      sendJson(res, 400, { ok: false, error: errorPayload(error) });
+      sendJson(res, 400, { ok: false, error: publicErrorPayload(error) });
       return;
     }
     if (!isObjectRecord(body)) {
@@ -1251,7 +1248,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     try {
       body = await readJson(req, this.maxBodyBytes);
     } catch (error) {
-      sendJson(res, 400, { ok: false, error: errorPayload(error) });
+      sendJson(res, 400, { ok: false, error: publicErrorPayload(error) });
       return;
     }
     if (!isObjectRecord(body)) {
@@ -1329,7 +1326,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     try {
       body = await readJson(req, this.maxBodyBytes);
     } catch (error) {
-      sendJson(res, 400, { ok: false, error: errorPayload(error) });
+      sendJson(res, 400, { ok: false, error: publicErrorPayload(error) });
       return;
     }
 
@@ -1356,12 +1353,13 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   private async finishWithError(context: JobContext, error: unknown): Promise<void> {
     if (context.ended) return;
     context.ended = true;
+    this.reportUnexpected(error, `in ${context.request.path}`);
     const response: NegotiationResponse = {
       protocol: 1,
       jobId: context.jobId,
       round: context.round,
       done: true,
-      error: errorPayload(error),
+      error: publicErrorPayload(error),
       actions: [],
     };
     if (context.expiryTimer) clearTimeout(context.expiryTimer);
