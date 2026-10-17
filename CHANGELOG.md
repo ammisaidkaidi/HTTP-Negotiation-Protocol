@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed (breaking)
+
+- Callback URLs without `publicBaseUrl` are only built for loopback hosts
+  (`localhost`, `127.0.0.1`, `[::1]`). Any other `Host` header now makes
+  `callback()` reject with an error that names `publicBaseUrl`. Set
+  `publicBaseUrl` for production deployments.
+- Action lookup resolves exact normalised names (`mathAdd` for `math.add`)
+  and dotted leaf names (`getAvailableSlots` for `delivery.getAvailableSlots`)
+  only. Partial names such as `dd` no longer run `math.add`, and an empty
+  normalised name is an unknown action.
+- External callbacks are recognised by their query and only on paths no
+  route serves. `createCallback` rejects a path that a route already serves,
+  so a callback URL can never take over a route.
+- A resume request must stay on the origin the call started on. The client
+  refuses a resume URL on another origin before sending anything.
+- A job that expires or is shut down fails with `JOB_EXPIRED` or
+  `SERVER_SHUTDOWN` even if its handler returns normally. No new round starts
+  after that, so no client service runs for an expired job.
+- `use()` rejects a plain object that mixes plugin hooks with service
+  functions. Register services with `provide()`.
+- A plugin's `onResponse` can change response fields but not the actions the
+  client has to execute.
+
+### Fixed
+
+- `server.run` and `server.ask` accept action names that match `Function`
+  properties (`name`, `length`, `call`, ...).
+- `end()` cleans up even when the client has disconnected, so such jobs no
+  longer stay registered.
+- Batch results (`require([...])`, `asks()`, `runs()`) are matched to actions
+  by `callbackID`, not by arrival order.
+- `maxJobs` holds when requests arrive with slow bodies.
+- A round that fails before it is sent no longer leaves the job stuck with
+  "already has a pending negotiation round".
+- Batch named aliases never overwrite `length`, index-like names, or
+  `Array.prototype` members.
+- Contract checks use own properties, so `constructor` and `toString` are
+  rejected unless the contract declares them.
+- `provide()` always registers services, and `use()` validates plugin hooks.
+- `maxResponseBytes` is enforced while the body streams.
+- Abort listeners are removed when each action settles.
+- `randomInt` terminates for ranges above 2^31.
+
 ## [2.0.0] - 2026-10-16
 
 ### Removed (breaking)

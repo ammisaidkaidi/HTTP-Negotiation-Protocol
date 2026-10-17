@@ -55,6 +55,19 @@ function assertPluginHooks(plugin: ClientPlugin): ClientPlugin {
       throw new TypeError(`Client plugin hook '${hook}' must be a function`);
     }
   }
+  // A plain object literal given to use() with a hook is a whole plugin, so any
+  // other function-valued entry in it would be silently dropped. Reject that.
+  // Class-based plugins (instances with their own state and callbacks) are exempt.
+  const hookNames: readonly string[] = PLUGIN_HOOKS;
+  const isLiteral = Object.getPrototypeOf(plugin) === Object.prototype;
+  const strays = !isLiteral ? [] : Object.keys(plugin).filter(
+    (key) => !hookNames.includes(key) && typeof (plugin as Record<string, unknown>)[key] === "function",
+  );
+  if (strays.length > 0) {
+    throw new TypeError(
+      `Client plugin object also defines service(s) ${strays.join(", ")}; register services with provide() instead`,
+    );
+  }
   return plugin;
 }
 

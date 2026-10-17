@@ -697,3 +697,17 @@ test("regression: an external callback still completes on a path no route serves
     assert.deepEqual(await new NegotiationClient().call({ url: `${baseUrl}/quote` }), { quoteId: "Q-1" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// 23. use() treated any map with a hook key as a plugin and silently dropped
+//     its other entries, so a service registered alongside a hook never ran.
+// ---------------------------------------------------------------------------
+test("regression: use() rejects a plugin object that also carries services", () => {
+  const client = new NegotiationClient();
+  assert.throws(
+    () => client.use({ onError: () => undefined, getUser: async () => "alice" } as never),
+    /provide\(\)/,
+  );
+  // A plugin with plain (non-function) metadata is still a valid plugin.
+  assert.doesNotThrow(() => client.use({ name: "audit", onRequest: () => undefined } as never));
+});
