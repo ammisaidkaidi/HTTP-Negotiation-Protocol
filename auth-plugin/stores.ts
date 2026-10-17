@@ -43,7 +43,7 @@ export class MemoryTokenStore extends TokenStore {
     return this.entries.delete(token);
   }
 
-  findByUid(uid: string): AuthRegistryEntry | undefined {
+  override findByUid(uid: string): AuthRegistryEntry | undefined {
     let latest: AuthRegistryEntry | undefined;
     for (const entry of this.entries.values()) {
       if (entry.uid === uid && entry.acknowledged && (!latest || entry.issuedAt > latest.issuedAt)) {

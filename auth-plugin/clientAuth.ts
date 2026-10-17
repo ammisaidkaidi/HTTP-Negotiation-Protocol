@@ -19,7 +19,11 @@
  * logged in. The session lives in a `SessionStorage` (default: memory).
  */
 import { NegotiationClient } from "../src/client/index.js";
-import type { ClientPlugin, HttpPluginRequest } from "../src/common/negotiations.js";
+import type {
+  ClientCallRequest,
+  ClientPlugin,
+  HttpPluginRequest,
+} from "../src/common/negotiations.js";
 import {
   applyChallenge,
   AUTH_CHALLENGE_FUNCTIONS,

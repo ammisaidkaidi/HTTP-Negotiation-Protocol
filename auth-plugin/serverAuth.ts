@@ -37,6 +37,7 @@ import {
   systemClock,
   type ChallengeAnswerPayload,
   type ChallengeFunction,
+  type AuthRegistryEntry,
   type ChallengePayload,
   type Clock,
   type PasswordLookup,
@@ -305,7 +306,7 @@ export class ServerAuthPlugin implements ServerPlugin {
       // -- Save the token to the registry FIRST, only then send it; the
       //    client's ack (auth.acceptToken) completes the login.
       const token = await this.tokenGenerator();
-      const entry = {
+      const entry: AuthRegistryEntry = {
         token,
         uid,
         authId,
