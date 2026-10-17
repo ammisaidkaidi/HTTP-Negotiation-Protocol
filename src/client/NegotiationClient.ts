@@ -216,7 +216,13 @@ export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
       }
 
       const results = await Promise.all(protocol.actions.map((action) => this.executeAction(action as ClientAction, request.signal)));
-      const resumeUrl = new URL(protocol.resumeUrl, initialUrl).toString();
+      const resumeTarget = new URL(protocol.resumeUrl, initialUrl);
+      // The resume request carries the caller's headers and the resume token,
+      // so it must never leave the origin the call started on.
+      if (resumeTarget.origin !== initialUrl.origin) {
+        throw new Error(`Negotiation resume URL must be on the same origin as the request (${initialUrl.origin})`);
+      }
+      const resumeUrl = resumeTarget.toString();
       response = await this.send(
         resumeUrl,
         {

@@ -196,8 +196,8 @@ interface JobContext {
   result: unknown;
   resultSet: boolean;
   ended: boolean;
-  /** Set by shutdown: the job is failing, but its client still gets the error. */
-  closing: boolean;
+  /** Set when the job fails from outside its handler (expiry, shutdown). Later rounds and results fail with it. */
+  failure?: Error;
   pending: PendingRound | undefined;
   latestOutgoing?: NegotiationResponse;
   externalCallbacks: Map<string, ExternalCallback>;
@@ -274,7 +274,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   private readonly actions = new Map<string, ServerAction>();
   private readonly plugins: ServerPlugin[] = [];
   private readonly jobs = new Map<string, JobContext>();
-  private readonly callbackPaths = new Set<string>();
+  private readonly defaultCallbackPathname: string;
   private httpServerInstance: HttpServer | undefined;
   private shutdownPromise: Promise<void> | undefined;
   private readonly publicBaseUrl: string | undefined;
@@ -292,7 +292,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     this.contract = options.contract;
     this.publicBaseUrl = options.publicBaseUrl;
     this.defaultCallbackPath = options.callbackPath ?? "/__negotiation/callback";
-    this.callbackPaths.add(new URL(this.defaultCallbackPath, "http://localhost").pathname);
+    this.defaultCallbackPathname = new URL(this.defaultCallbackPath, "http://localhost").pathname;
     this.maxBodyBytes = options.maxBodyBytes ?? 1_000_000;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 120_000;
     this.callbackTimeoutMs = options.callbackTimeoutMs ?? this.requestTimeoutMs;
@@ -315,6 +315,8 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       new Error(`Negotiation job ${context.jobId} exceeded its maximum lifetime`),
       { code: "JOB_EXPIRED" },
     );
+    // Record the failure first: no later round, and no result from the handler, may revive the job.
+    context.failure = error;
     if (context.pending) {
       const pending = context.pending;
       context.pending = undefined;
@@ -481,10 +483,10 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     }
     const normalize = (value: string) => value.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
     const wanted = normalize(path);
-    const fuzzy = [...this.actions.keys()].filter((key) => {
-      const candidate = normalize(key);
-      return candidate === wanted || candidate.endsWith(wanted);
-    });
+    // Exact normalised match only. A substring match let `dd` run `math.add`,
+    // and an empty normalised name matched every action.
+    if (wanted === "") return path;
+    const fuzzy = [...this.actions.keys()].filter((key) => normalize(key) === wanted);
     if (fuzzy.length === 1) return fuzzy[0] as string;
     if (fuzzy.length > 1) {
       throw new Error(`Ambiguous server action '${path}' (matches: ${fuzzy.join(", ")}); use the full dotted name`);
@@ -614,7 +616,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       });
       for (const context of this.jobs.values()) {
         if (context.expiryTimer) clearTimeout(context.expiryTimer);
-        context.closing = true;
+        context.failure = shutdownError;
         if (context.pending) {
           const pending = context.pending;
           context.pending = undefined;
@@ -867,9 +869,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
 
   private async requestClientActions(inputActions: ClientAction[]): Promise<ActionResult[]> {
     const context = this.requireContext();
-    if (context.closing) {
-      throw Object.assign(new Error("Negotiation server is shutting down"), { code: "SERVER_SHUTDOWN" });
-    }
+    if (context.failure) throw context.failure;
     if (context.ended) throw new Error("Cannot negotiate after Server.end()");
     if (context.pending) throw new Error("This job already has a pending negotiation round");
     if (!Array.isArray(inputActions) || inputActions.length === 0) {
@@ -985,7 +985,10 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     const callbackBase = typeof callbackOrUrl === "string" ? callbackOrUrl : this.defaultCallbackPath;
     const base = this.callbackOrigin(context.request);
     const callbackURL = new URL(callbackBase, base);
-    this.callbackPaths.add(callbackURL.pathname);
+    // A callback URL must never take over a route: refuse a path a route already serves.
+    if (this.routes.has(callbackURL.pathname)) {
+      throw new Error(`Callback URL path '${callbackURL.pathname}' is a route on this server; choose a different callback path`);
+    }
     callbackURL.searchParams.set("jobId", context.jobId);
     callbackURL.searchParams.set("callbackID", callbackID);
     callbackURL.searchParams.set("token", token);
@@ -1029,6 +1032,10 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   async end(result?: unknown): Promise<void> {
     const context = this.requireContext();
     if (context.ended) return;
+    // A job that expired or was shut down fails to its client, even if the handler returns normally.
+    if (context.failure) return this.finishWithError(context, context.failure);
+    // Claim the job before the first await, so a second end() cannot run the hooks again.
+    context.ended = true;
     if (context.expiryTimer) clearTimeout(context.expiryTimer);
     if (arguments.length > 0) {
       context.result = result;
@@ -1049,7 +1056,6 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       await plugin.onNegotiationEnd?.(payload); // deprecated alias
       await plugin.onJobEnd?.(payload); // deprecated alias
     });
-    context.ended = true;
     context.latestOutgoing = response;
     // The client may already have disconnected. The job is finished either way,
     // so answer only an open response, and always clean up.
@@ -1142,7 +1148,14 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       await this.handleResume(req, res);
       return;
     }
-    if (req.method === "POST" && this.callbackPaths.has(url.pathname)) {
+    // External callbacks are recognised by their query, and only on a path no
+    // route claims, so a callback URL can never take over a route.
+    const isCallbackUrl = ["jobId", "callbackID", "token"].every((name) => url.searchParams.has(name));
+    if (
+      req.method === "POST" &&
+      !this.routes.has(url.pathname) &&
+      (url.pathname === this.defaultCallbackPathname || isCallbackUrl)
+    ) {
       await this.handleExternalCallback(req, res, url);
       return;
     }
@@ -1198,7 +1211,6 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       result: null,
       resultSet: false,
       ended: false,
-      closing: false,
       pending: undefined,
       externalCallbacks: new Map(),
       receivedExternalCallbacks: new Set(),
@@ -1343,6 +1355,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
 
   private async finishWithError(context: JobContext, error: unknown): Promise<void> {
     if (context.ended) return;
+    context.ended = true;
     const response: NegotiationResponse = {
       protocol: 1,
       jobId: context.jobId,
@@ -1358,7 +1371,6 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       await plugin.onNegotiationError?.(payload); // deprecated alias
       await plugin.onJobError?.(payload); // deprecated alias
     });
-    context.ended = true;
     context.latestOutgoing = response;
     const currentResponse = context.currentResponse;
     if (currentResponse && !currentResponse.writableEnded && !currentResponse.destroyed) {

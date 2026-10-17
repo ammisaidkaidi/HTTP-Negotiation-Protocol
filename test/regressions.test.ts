@@ -503,3 +503,197 @@ test("regression: maxJobs holds even when many requests arrive with slow bodies"
     await Promise.all(statuses);
   }
 });
+
+// ---------------------------------------------------------------------------
+// 16. server.run's fuzzy fallback matched substrings: `dd` ran math.add, so a
+//     typo could trigger a real side effect. An empty normalised name matched
+//     every action.
+// ---------------------------------------------------------------------------
+test("regression: server.run does not resolve a partial or empty name to a real action", async () => {
+  let ran = 0;
+  const server = new NegotiationServer();
+  server.use({
+    "math.add": async ({ a, b }: { a: number; b: number }) => {
+      ran += 1;
+      return a + b;
+    },
+  });
+  await assert.rejects(server.run.dd({ a: 1, b: 2 }), /Unknown server action/);
+  await assert.rejects(server.run["..."]({}), /Unknown server action/);
+  assert.equal(ran, 0);
+  // The documented normalised name still resolves.
+  assert.equal(await server.run.mathAdd({ a: 2, b: 3 }), 5);
+});
+
+// ---------------------------------------------------------------------------
+// 17. A callback URL's path was added to a global set that is checked before
+//     routes, so POSTs to a route with that path were answered as callbacks
+//     (403) and the set grew without bound.
+// ---------------------------------------------------------------------------
+test("regression: a callback URL cannot take over a path that a route serves", async () => {
+  const server = new NegotiationServer({ callbackTimeoutMs: 200 });
+  server.use({ "hooks.quick": async () => "noop" });
+  server.handle("/orders", async () => ({ ok: true }));
+  server.handle("/hook", async () => ({ ok: true }));
+  server.handle("/setup", async () => {
+    const refusals: string[] = [];
+    for (const callbackPath of ["/orders", "https://partner.example/hook"]) {
+      await server.callback("hooks.quick", {}, callbackPath).catch((error: Error) => {
+        refusals.push(error.message);
+      });
+    }
+    return refusals;
+  });
+
+  await withServer(server, async (baseUrl) => {
+    const client = new NegotiationClient();
+    const refusals = (await client.call({ url: `${baseUrl}/setup` })) as string[];
+    assert.equal(refusals.length, 2);
+    for (const message of refusals) assert.match(message, /is a route on this server/);
+    assert.deepEqual(await client.call({ url: `${baseUrl}/orders` }), { ok: true });
+    assert.deepEqual(await client.call({ url: `${baseUrl}/hook` }), { ok: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 18. The client sent the resume request, with the caller's headers and the
+//     resume token, to whatever origin the server named, including other hosts.
+// ---------------------------------------------------------------------------
+function readAll(req: import("node:http").IncomingMessage): Promise<string> {
+  return new Promise((resolve) => {
+    let text = "";
+    req.on("data", (chunk) => (text += chunk));
+    req.on("end", () => resolve(text));
+  });
+}
+
+test("regression: the client refuses to send a resume request to another origin", async () => {
+  let otherOriginRequests = 0;
+  const other = createHttpServer(async (req, res) => {
+    otherOriginRequests += 1;
+    await readAll(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ protocol: 1, jobId: "j1", round: 2, done: true, result: "ok", actions: [] }));
+  });
+  await new Promise<void>((resolve) => other.listen(0, "127.0.0.1", resolve));
+  const otherPort = (other.address() as AddressInfo).port;
+
+  const origin = createHttpServer(async (req, res) => {
+    await readAll(req);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      protocol: 1, jobId: "j1", round: 1, done: false, result: null,
+      actions: [{ name: "ping", data: null, callbackID: "cb1" }],
+      resumeUrl: `http://127.0.0.1:${otherPort}/steal`,
+      resumeToken: "resume-token-123",
+    }));
+  });
+  await new Promise<void>((resolve) => origin.listen(0, "127.0.0.1", resolve));
+  const originPort = (origin.address() as AddressInfo).port;
+
+  const client = new NegotiationClient();
+  client.provide({ ping: async () => "pong" });
+  try {
+    await assert.rejects(
+      client.call({ url: `http://127.0.0.1:${originPort}/job`, headers: { authorization: "Bearer SECRET" } }),
+      /same origin/,
+    );
+    assert.equal(otherOriginRequests, 0);
+  } finally {
+    origin.closeAllConnections();
+    origin.close();
+    other.closeAllConnections();
+    other.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 19. Two end() calls made without await both passed the `ended` check before
+//     either set it, so onCallEnd ran more than once.
+// ---------------------------------------------------------------------------
+test("regression: end() called twice runs onCallEnd once", async () => {
+  let hookRuns = 0;
+  const server = new NegotiationServer();
+  server.plugin({
+    onCallEnd: async () => {
+      hookRuns += 1;
+      await pause(30);
+    },
+  });
+  server.handle("/job", async () => {
+    void server.end("a");
+    void server.end("b");
+  });
+
+  await withServer(server, async (baseUrl) => {
+    await new NegotiationClient().call({ url: `${baseUrl}/job` });
+    await pause(100);
+    assert.equal(hookRuns, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 20. After a job expired, a handler that caught the expiry error could still
+//     start a round. The client ran the service (a side effect) before its
+//     resume failed with UNKNOWN_JOB, and the client never saw JOB_EXPIRED.
+// ---------------------------------------------------------------------------
+test("regression: an expired job starts no new rounds and reports JOB_EXPIRED", async () => {
+  let charges = 0;
+  const server = new NegotiationServer({ jobTimeoutMs: 300, callbackTimeoutMs: 60_000, requestTimeoutMs: 2_000 });
+  server.use({ "hooks.never": async () => new Promise(() => undefined) });
+  let handlerSaw = "";
+  server.handle("/job", async () => {
+    try {
+      await server.callback("hooks.never", {});
+    } catch (error) {
+      handlerSaw += `${(error as { code?: string }).code} `;
+    }
+    try {
+      await server.require("charge");
+      handlerSaw += "round-issued";
+    } catch (error) {
+      handlerSaw += `require:${(error as { code?: string }).code}`;
+    }
+    return "done";
+  });
+  const client = new NegotiationClient({ requestTimeoutMs: 5_000 });
+  client.provide({
+    charge: async () => {
+      charges += 1;
+      return "charged";
+    },
+  });
+
+  await withServer(server, async (baseUrl) => {
+    await assert.rejects(
+      client.call({ url: `${baseUrl}/job` }),
+      (error: unknown) => (error as { code?: string }).code === "JOB_EXPIRED",
+    );
+  });
+  assert.equal(charges, 0, "the client executed a service for an expired job");
+  assert.match(handlerSaw, /require:JOB_EXPIRED/);
+});
+
+// ---------------------------------------------------------------------------
+// 21. Callback URLs are recognised by the path they were created with, and
+//     route lookup comes after that check. The fix must keep working for a
+//     callback on a path no route claims, so this is the positive control.
+// ---------------------------------------------------------------------------
+test("regression: an external callback still completes on a path no route serves", async () => {
+  const server = new NegotiationServer();
+  server.use({
+    "hooks.quote": async (data: { callbackUrl: string }) => {
+      void fetch(data.callbackUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ quoteId: "Q-1" }),
+      });
+      return "scheduled";
+    },
+  });
+  server.handle("/quote", async () => await server.callback("hooks.quote", {}, "/hooks/carrier"));
+
+  await withServer(server, async (baseUrl) => {
+    assert.deepEqual(await new NegotiationClient().call({ url: `${baseUrl}/quote` }), { quoteId: "Q-1" });
+  });
+});
