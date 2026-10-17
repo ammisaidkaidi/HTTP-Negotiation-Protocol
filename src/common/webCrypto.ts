@@ -106,16 +106,18 @@ export function randomInt(min: number, maxExclusive: number): number {
   }
   const range = maxExclusive - min;
   if (!Number.isSafeInteger(range)) throw new TypeError("randomInt range is too large");
-  // Rejection sampling over just enough random bits avoids modulo bias.
-  let mask = 1;
-  while (mask < range - 1) mask = (mask << 1) | 1;
-  const byteLength = Math.max(1, Math.ceil(Math.log2(mask + 1) / 8));
+  // BigInt keeps the arithmetic exact for every safe-integer range. (32-bit
+  // bitwise operators overflow above 2^31, which used to make this loop forever.)
+  const span = BigInt(range);
+  const byteLength = Math.max(1, Math.ceil((span - 1n).toString(2).length / 8));
+  const space = 1n << BigInt(byteLength * 8);
+  // Rejection sampling: discard draws in the uneven tail to avoid modulo bias.
+  const limit = space - (space % span);
   while (true) {
     const bytes = randomBytes(byteLength);
-    let value = 0;
-    for (const byte of bytes) value = value * 256 + byte;
-    value &= mask;
-    if (value < range) return min + value;
+    let value = 0n;
+    for (const byte of bytes) value = (value << 8n) | BigInt(byte);
+    if (value < limit) return min + Number(value % span);
   }
 }
 

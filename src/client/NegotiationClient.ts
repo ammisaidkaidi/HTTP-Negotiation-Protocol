@@ -28,11 +28,69 @@ export { haltRequest, RequestHaltedError, type ClientCallRequest } from "../comm
  * stripped. Plugins cannot observe asks/responseAsks — ask payloads and
  * service results never reach plugin hooks.
  */
+function isEnvelope(value: unknown): value is Record<string, unknown> & { actions: unknown[] } {
+  return isObjectRecord(value) && value.protocol === 1 && Array.isArray(value.actions);
+}
+
 function redactEnvelopeForPlugins(body: unknown): unknown {
-  if (isObjectRecord(body) && body.protocol === 1 && Array.isArray(body.actions)) {
-    return { ...body, actions: [] };
+  return isEnvelope(body) ? { ...body, actions: [] } : body;
+}
+
+/**
+ * Merge a plugin's returned body into the real response. Plugins only ever
+ * saw `actions: []`, so whatever they return can change other fields but never
+ * replace the asks the client has to execute.
+ */
+function applyPluginResponse(current: unknown, changed: unknown): unknown {
+  if (!isEnvelope(current)) return changed;
+  if (!isObjectRecord(changed)) return current;
+  return { ...current, ...changed, actions: current.actions };
+}
+
+const PLUGIN_HOOKS = ["onRequest", "onResponse", "onError"] as const;
+
+function assertPluginHooks(plugin: ClientPlugin): ClientPlugin {
+  for (const hook of PLUGIN_HOOKS) {
+    if (plugin[hook] !== undefined && typeof plugin[hook] !== "function") {
+      throw new TypeError(`Client plugin hook '${hook}' must be a function`);
+    }
   }
-  return body;
+  return plugin;
+}
+
+/**
+ * Read a response body as text, cancelling the stream as soon as it exceeds
+ * `maxBytes`, so an oversized response is never buffered in full.
+ */
+async function readLimitedText(response: Response, maxBytes: number, url: string): Promise<string> {
+  const tooLarge = () =>
+    Object.assign(new Error(`Response from ${url} exceeds ${maxBytes} bytes`), { code: "RESPONSE_TOO_LARGE" });
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await response.body?.cancel();
+    throw tooLarge();
+  }
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw tooLarge();
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 function responseHeaders(res: Response): Record<string, string> {
@@ -75,11 +133,11 @@ export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
     if (Array.isArray(pluginOrServices)) {
       for (const plugin of pluginOrServices) {
         if (!isObjectRecord(plugin)) throw new TypeError("Each client plugin must be an object");
-        this.plugins.push(plugin as ClientPlugin);
+        this.plugins.push(assertPluginHooks(plugin as ClientPlugin));
       }
     } else if (isObjectRecord(pluginOrServices) &&
       ("onRequest" in pluginOrServices || "onResponse" in pluginOrServices || "onError" in pluginOrServices)) {
-      this.plugins.push(pluginOrServices as ClientPlugin);
+      this.plugins.push(assertPluginHooks(pluginOrServices as ClientPlugin));
     } else {
       for (const [name, service] of Object.entries(pluginOrServices)) {
         if (typeof service !== "function") throw new TypeError(`Client service '${name}' must be a function`);
@@ -94,14 +152,17 @@ export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
    * Subsets are allowed; call it more than once to register the rest.
    */
   provide(services: ProvideFor<C>): this {
-    if (this.contract?.client) {
-      for (const name of Object.keys(services)) {
-        if (!(name in this.contract.client)) {
-          throw new TypeError(`Client service '${name}' is not defined in the contract`);
-        }
+    const entries = Object.entries(services as ClientServices);
+    for (const [name, service] of entries) {
+      if (this.contract?.client && !Object.hasOwn(this.contract.client, name)) {
+        throw new TypeError(`Client service '${name}' is not defined in the contract`);
       }
+      if (typeof service !== "function") throw new TypeError(`Client service '${name}' must be a function`);
     }
-    return this.use(services as ClientServices);
+    // Always services. Unlike use(), never guess whether a map is a plugin, so a
+    // service named onError or onRequest is still registered.
+    for (const [name, service] of entries) this.services.set(name, service);
+    return this;
   }
 
   async call(request: ClientCallRequest): Promise<unknown> {
@@ -188,6 +249,7 @@ export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
       };
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
     try {
       const racers: Promise<unknown>[] = [Promise.resolve().then(() => service(action.data))];
       racers.push(new Promise<never>((_, reject) => {
@@ -195,8 +257,13 @@ export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
       }));
       if (signal) {
         racers.push(new Promise<never>((_, reject) => {
-          if (signal.aborted) reject(Object.assign(new Error("Client.call was aborted"), { code: "ABORTED" }));
-          else signal.addEventListener("abort", () => reject(Object.assign(new Error("Client.call was aborted"), { code: "ABORTED" })), { once: true });
+          const abortError = () => Object.assign(new Error("Client.call was aborted"), { code: "ABORTED" });
+          if (signal.aborted) {
+            reject(abortError());
+            return;
+          }
+          onAbort = () => reject(abortError());
+          signal.addEventListener("abort", onAbort, { once: true });
         }));
       }
       const result = await Promise.race(racers);
@@ -205,6 +272,7 @@ export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
       return { callbackID: action.callbackID, ok: false, error: errorPayload(error) };
     } finally {
       if (timer) clearTimeout(timer);
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
     }
   }
 
@@ -251,12 +319,7 @@ export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
         body: JSON.stringify(outgoing.body),
         signal: signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal,
       });
-      const text = await fetchResponse.text();
-      if (new TextEncoder().encode(text).length > this.maxResponseBytes) {
-        throw Object.assign(new Error(`Response from ${outgoing.url} exceeds ${this.maxResponseBytes} bytes`), {
-          code: "RESPONSE_TOO_LARGE",
-        });
-      }
+      const text = await readLimitedText(fetchResponse, this.maxResponseBytes, outgoing.url);
       let responseBody: unknown;
       try {
         responseBody = text ? JSON.parse(text) : null;
@@ -273,7 +336,7 @@ export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
         if (plugin.onResponse) {
           // Plugins see the envelope with asked actions stripped (privacy).
           const changed = await plugin.onResponse(redactEnvelopeForPlugins(responseBody), meta);
-          if (changed !== undefined) responseBody = changed;
+          if (changed !== undefined) responseBody = applyPluginResponse(responseBody, changed);
         }
       }
       if (!fetchResponse.ok) {

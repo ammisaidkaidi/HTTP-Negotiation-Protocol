@@ -154,6 +154,17 @@ function waitForResponseEnd(res: ServerResponse): Promise<void> {
 }
 
 
+/**
+ * Attach a named alias to a batch results array. Aliases never overwrite the
+ * array itself: `length`, index-like names, and Array.prototype members (such
+ * as `map`) are skipped, so the results stay usable as an array. Reach those
+ * values by index instead.
+ */
+function assignNamed(results: unknown[], key: string, value: unknown): void {
+  if (key === "length" || /^\d+$/u.test(key) || key in Array.prototype) return;
+  (results as unknown as Record<string, unknown>)[key] = value;
+}
+
 function unwrapActionResult(item: ActionResult): unknown {
   if (item.ok) return item.result;
   const error = new Error(item.error.message) as Error & { code: string };
@@ -185,6 +196,8 @@ interface JobContext {
   result: unknown;
   resultSet: boolean;
   ended: boolean;
+  /** Set by shutdown: the job is failing, but its client still gets the error. */
+  closing: boolean;
   pending: PendingRound | undefined;
   latestOutgoing?: NegotiationResponse;
   externalCallbacks: Map<string, ExternalCallback>;
@@ -193,6 +206,15 @@ interface JobContext {
 }
 
 const ACTION_INVOCATION = Symbol("server-action-invocation");
+
+/** Property names a proxy must never turn into action-name segments (thenable safety). */
+const PROXY_RESERVED_PROPS = new Set(["then", "catch", "finally"]);
+
+/**
+ * Hosts a request may name for callback URLs when no `publicBaseUrl` is set.
+ * Anything else comes from an attacker-controllable Host header.
+ */
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /** A lazy server action: await it for direct execution, or pass it to createCallback. */
 export class ServerActionInvocation<T = unknown> implements PromiseLike<T> {
@@ -417,7 +439,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   get ask(): AskFor<C> {
     return this.createPathProxy([], async (path, data) => {
       if (!path) throw new TypeError("server.ask must be called on a service name, e.g. server.ask.getName()");
-      if (this.contract?.client && !(path in this.contract.client)) {
+      if (this.contract?.client && !Object.hasOwn(this.contract.client, path)) {
         throw new TypeError(`Client service '${path}' is not defined in the contract`);
       }
       return this.require(path, data);
@@ -442,7 +464,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
   implement(actions: ImplementFor<C>): this {
     if (this.contract?.server) {
       for (const name of Object.keys(actions)) {
-        if (!(name in this.contract.server)) {
+        if (!Object.hasOwn(this.contract.server, name)) {
           throw new TypeError(`Server action '${name}' is not defined in the contract`);
         }
       }
@@ -478,8 +500,9 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     return new Proxy(callable, {
       get: (target, prop) => {
         if (typeof prop !== "string") return Reflect.get(target, prop);
-        // Never become a thenable / never shadow real Function members.
-        if (prop === "then" || prop === "catch" || prop === "finally" || prop in target) {
+        // Never become a thenable. Every other name, including Function
+        // members such as name/length/call, is an action-name segment.
+        if (PROXY_RESERVED_PROPS.has(prop)) {
           return Reflect.get(target, prop);
         }
         return this.createPathProxy([...segments, prop], invoke);
@@ -591,7 +614,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       });
       for (const context of this.jobs.values()) {
         if (context.expiryTimer) clearTimeout(context.expiryTimer);
-        context.ended = true;
+        context.closing = true;
         if (context.pending) {
           const pending = context.pending;
           context.pending = undefined;
@@ -717,9 +740,9 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       // (leaf name and full dotted name) for named access.
       const results: any = [...values];
       entries.forEach((entry, index) => {
-        results[entry.name] = values[index];
+        assignNamed(results, entry.name, values[index]);
         const leaf = entry.name.split(".").pop();
-        if (leaf && leaf !== entry.name) results[leaf] = values[index];
+        if (leaf && leaf !== entry.name) assignNamed(results, leaf, values[index]);
       });
       return results;
     };
@@ -752,7 +775,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
               done().then(resolve as never, reject as never);
           }
           if (typeof prop !== "string") return Reflect.get(target, prop);
-          if (prop in target) return Reflect.get(target, prop);
+          if (PROXY_RESERVED_PROPS.has(prop)) return Reflect.get(target, prop);
           return createNode([...segments, prop]);
         },
         apply: (_target, _thisArg, args) =>
@@ -793,11 +816,11 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       // (leaf name and full dotted name) for named access.
       const results: any = [...values];
       entries.forEach((entry, index) => {
-        results[entry.name] = values[index];
+        assignNamed(results, entry.name, values[index]);
         const resolved = this.resolveServerActionName(entry.name);
-        if (resolved !== entry.name) results[resolved] = values[index];
+        if (resolved !== entry.name) assignNamed(results, resolved, values[index]);
         const leaf = resolved.split(".").pop();
-        if (leaf && leaf !== resolved) results[leaf] = values[index];
+        if (leaf && leaf !== resolved) assignNamed(results, leaf, values[index]);
       });
       return results;
     };
@@ -830,7 +853,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
               done().then(resolve as never, reject as never);
           }
           if (typeof prop !== "string") return Reflect.get(target, prop);
-          if (prop in target) return Reflect.get(target, prop);
+          if (PROXY_RESERVED_PROPS.has(prop)) return Reflect.get(target, prop);
           return createNode([...segments, prop]);
         },
         apply: (_target, _thisArg, args) =>
@@ -844,6 +867,9 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
 
   private async requestClientActions(inputActions: ClientAction[]): Promise<ActionResult[]> {
     const context = this.requireContext();
+    if (context.closing) {
+      throw Object.assign(new Error("Negotiation server is shutting down"), { code: "SERVER_SHUTDOWN" });
+    }
     if (context.ended) throw new Error("Cannot negotiate after Server.end()");
     if (context.pending) throw new Error("This job already has a pending negotiation round");
     if (!Array.isArray(inputActions) || inputActions.length === 0) {
@@ -865,23 +891,30 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       reject: wait.reject,
     };
 
-    // Rotate the resume token every round: a leaked token can only ever
-    // resume the single round it was issued for, and only once.
-    const resumeToken = randomUuid();
-    context.resumeTokenHash = await tokenHash(resumeToken);
-    const response: NegotiationResponse = {
-      protocol: 1,
-      jobId: context.jobId,
-      round,
-      done: false,
-      result: null,
-      actions: inputActions,
-      resumeUrl: "/__negotiation/resume",
-      resumeToken,
-    };
-    await this.runPlugins((plugin) =>
-      plugin.onRound?.({ ...this.pluginCall(context), round }));
-    this.sendProtocolResponse(context, response);
+    try {
+      // Rotate the resume token every round: a leaked token can only ever
+      // resume the single round it was issued for, and only once.
+      const resumeToken = randomUuid();
+      context.resumeTokenHash = await tokenHash(resumeToken);
+      const response: NegotiationResponse = {
+        protocol: 1,
+        jobId: context.jobId,
+        round,
+        done: false,
+        result: null,
+        actions: inputActions,
+        resumeUrl: "/__negotiation/resume",
+        resumeToken,
+      };
+      await this.runPlugins((plugin) =>
+        plugin.onRound?.({ ...this.pluginCall(context), round }));
+      this.sendProtocolResponse(context, response);
+    } catch (error) {
+      // The round was never sent, so nothing can resume it. Clear it so the
+      // handler can retry or fail cleanly instead of hitting "already pending".
+      if (context.pending?.round === round) context.pending = undefined;
+      throw error;
+    }
 
     const timeout = setTimeout(() => {
       if (context.pending?.round === round) {
@@ -890,7 +923,16 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       }
     }, this.requestTimeoutMs);
     try {
-      return await wait.promise;
+      const results = await wait.promise;
+      // Pair each result with its action by callbackID, never by arrival order.
+      const byId = new Map<string, ActionResult>(
+        results.map((result): [string, ActionResult] => [result.callbackID, result]),
+      );
+      return inputActions.map((action) => {
+        const result = byId.get(action.callbackID);
+        if (!result) throw new Error(`Missing result for callbackID ${action.callbackID}`);
+        return result;
+      });
     } finally {
       clearTimeout(timeout);
     }
@@ -941,7 +983,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     const callbackID = `cb_${randomUuid()}`;
     const token = randomUuid();
     const callbackBase = typeof callbackOrUrl === "string" ? callbackOrUrl : this.defaultCallbackPath;
-    const base = this.publicBaseUrl ?? context.request.origin;
+    const base = this.callbackOrigin(context.request);
     const callbackURL = new URL(callbackBase, base);
     this.callbackPaths.add(callbackURL.pathname);
     callbackURL.searchParams.set("jobId", context.jobId);
@@ -1009,7 +1051,9 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     });
     context.ended = true;
     context.latestOutgoing = response;
-    this.sendJsonToCurrentResponse(context, response);
+    // The client may already have disconnected. The job is finished either way,
+    // so answer only an open response, and always clean up.
+    if (this.hasOpenResponse(context)) this.sendJsonToCurrentResponse(context, response);
     this.cleanupWhenFinished(context);
   }
 
@@ -1032,9 +1076,29 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     return context;
   }
 
+  /**
+   * Origin used to build callback URLs. `publicBaseUrl` always wins. Without
+   * it, the request's Host header is attacker-controlled, so it is used only
+   * when it names a loopback host (local development). Anything else fails
+   * closed instead of handing external services an attacker-chosen host.
+   */
+  private callbackOrigin(request: ServerRequest): string {
+    if (this.publicBaseUrl) return this.publicBaseUrl;
+    const hostname = new URL(request.origin).hostname;
+    if (LOOPBACK_HOSTNAMES.has(hostname)) return request.origin;
+    throw new Error(
+      `Cannot build a callback URL for host '${hostname}': set publicBaseUrl on the NegotiationServer`,
+    );
+  }
+
   private sendProtocolResponse(context: JobContext, response: NegotiationResponse): void {
     context.latestOutgoing = response;
     this.sendJsonToCurrentResponse(context, response);
+  }
+
+  private hasOpenResponse(context: JobContext): boolean {
+    const response = context.currentResponse;
+    return Boolean(response && !response.writableEnded && !response.destroyed);
   }
 
   private sendJsonToCurrentResponse(context: JobContext, payload: unknown): void {
@@ -1110,9 +1174,16 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
     }
 
     const jobId = randomUuid();
+    // Every await must come before the capacity check: between the check and
+    // jobs.set() nothing may yield, or requests with slow bodies overshoot maxJobs.
+    const resumeTokenHash = await tokenHash(randomUuid());
+    if (this.jobs.size >= this.maxJobs) {
+      sendJson(res, 503, { ok: false, error: { code: "TOO_MANY_JOBS", message: "Too many active negotiation jobs" } });
+      return;
+    }
     const context: JobContext = {
       jobId,
-      resumeTokenHash: await tokenHash(randomUuid()),
+      resumeTokenHash,
       request: {
         jobId,
         method: req.method,
@@ -1127,6 +1198,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       result: null,
       resultSet: false,
       ended: false,
+      closing: false,
       pending: undefined,
       externalCallbacks: new Map(),
       receivedExternalCallbacks: new Set(),
