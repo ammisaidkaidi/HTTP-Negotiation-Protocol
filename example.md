@@ -252,8 +252,7 @@ import { handledResult, NegotiationServer, type ServerPlugin } from "http-negoti
 const audit: ServerPlugin = {
   name: "audit",
   onCallStart: ({ jobId, path }) => console.log(`job ${jobId} started on ${path}`),
-  onRound: ({ round, actions }) =>
-    console.log(`round ${round}: ${actions.map((a) => a.name).join(", ")}`),
+  onRound: ({ round }) => console.log(`round ${round}`),
   onCallEnd: ({ result }) => console.log("finished:", result),
   onCallError: ({ error }) => console.error("failed:", error.message),
 };

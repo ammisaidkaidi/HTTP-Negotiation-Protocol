@@ -880,7 +880,7 @@ export class NegotiationServer<C extends ContractDefinition = EmptyContract> {
       resumeToken,
     };
     await this.runPlugins((plugin) =>
-      plugin.onRound?.({ ...this.pluginCall(context), round, actions: inputActions }));
+      plugin.onRound?.({ ...this.pluginCall(context), round }));
     this.sendProtocolResponse(context, response);
 
     const timeout = setTimeout(() => {

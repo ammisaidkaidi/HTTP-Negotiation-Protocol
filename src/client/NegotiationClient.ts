@@ -23,6 +23,18 @@ import {
 
 export { haltRequest, RequestHaltedError, type ClientCallRequest } from "../common/negotiations.js";
 
+/**
+ * What plugins may see of a negotiation envelope: the asked actions are
+ * stripped. Plugins cannot observe asks/responseAsks — ask payloads and
+ * service results never reach plugin hooks.
+ */
+function redactEnvelopeForPlugins(body: unknown): unknown {
+  if (isObjectRecord(body) && body.protocol === 1 && Array.isArray(body.actions)) {
+    return { ...body, actions: [] };
+  }
+  return body;
+}
+
 function responseHeaders(res: Response): Record<string, string> {
   const output: Record<string, string> = {};
   res.headers.forEach((value, key) => (output[key] = value));
@@ -210,6 +222,14 @@ export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
       body,
       phase,
     };
+    // Ask privacy: on resume rounds the body carries service RESULTS, which
+    // plugins must not observe. Plugins see a redacted request (they can
+    // still observe timing/headers and halt); any body a plugin returns
+    // for a resume is discarded — the real results are sent untouched.
+    const isResume = phase === "resume";
+    let pluginRequest: HttpPluginRequest = isResume
+      ? { ...outgoing, body: { __redacted: "negotiation results are hidden from plugins" } }
+      : outgoing;
     try {
       // Plugin chain: awaited in registration order before fetch. A plugin
       // halts the chain by returning false, throwing, or calling
@@ -217,11 +237,12 @@ export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
       // through onError below, and client.call() rejects with it.
       for (const plugin of this.plugins) {
         if (plugin.onRequest) {
-          const changed = await plugin.onRequest(outgoing);
+          const changed = await plugin.onRequest(pluginRequest);
           if (changed === false) throw new RequestHaltedError();
-          if (changed) outgoing = changed;
+          if (changed) pluginRequest = changed;
         }
       }
+      outgoing = isResume ? { ...pluginRequest, body } : pluginRequest;
 
       const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
       const fetchResponse = await fetch(outgoing.url, {
@@ -250,7 +271,8 @@ export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
       };
       for (const plugin of this.plugins) {
         if (plugin.onResponse) {
-          const changed = await plugin.onResponse(responseBody, meta);
+          // Plugins see the envelope with asked actions stripped (privacy).
+          const changed = await plugin.onResponse(redactEnvelopeForPlugins(responseBody), meta);
           if (changed !== undefined) responseBody = changed;
         }
       }
@@ -264,7 +286,7 @@ export class NegotiationClient<C extends ContractDefinition = EmptyContract> {
     } catch (error) {
       const converted = toError(error);
       for (const plugin of this.plugins) {
-        await plugin.onError?.(converted, outgoing);
+        await plugin.onError?.(converted, isResume ? pluginRequest : outgoing);
       }
       throw converted;
     }

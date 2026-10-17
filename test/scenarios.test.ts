@@ -577,11 +577,11 @@ add("F onCallStart and onCallEnd fire around a successful job", () => withRig(as
   await call(rig, "/echo", { x: 1 });
   assert.deepEqual(events, ["start:/echo", 'end:{"x":1}']);
 }));
-add("F onRound fires per round with action names", () => withRig(async (rig) => {
+add("F onRound fires per round (no ask details exposed to plugins)", () => withRig(async (rig) => {
   const rounds: string[] = [];
-  rig.server.plugin({ onRound: (r) => { rounds.push(`${r.round}:${r.actions.map((a) => a.name).join("+")}`); } });
+  rig.server.plugin({ onRound: (r) => { rounds.push(`${r.round}:${"actions" in r}`); } });
   await call(rig, "/ask-two");
-  assert.deepEqual(rounds, ["1:getName", "2:getCity"]);
+  assert.deepEqual(rounds, ["1:false", "2:false"]);
 }));
 add("F onCallError fires when the handler throws", () => withRig(async (rig) => {
   const errors: string[] = [];
@@ -764,10 +764,10 @@ add("H three sequential rounds resolve in order", () => withRig(async (rig) => {
   assert.equal(rig.ctx.serviceCalls.getCity, 1);
 }));
 add("H batched asks are a single round carrying both actions", () => withRig(async (rig) => {
-  const rounds: string[][] = [];
-  rig.server.plugin({ onRound: (r) => { rounds.push(r.actions.map((a) => a.name)); } });
+  const rounds: number[] = [];
+  rig.server.plugin({ onRound: (r) => { rounds.push(r.round); } });
   await call(rig, "/batch");
-  assert.deepEqual(rounds[0], ["getProfile", "getPreferences"]);
+  assert.deepEqual(rounds, [1]); // both asks travelled in ONE round
 }));
 add("H client constructor maxRounds option caps the call", () => withRig(async (rig) => {
   const client = new NegotiationClient({ maxRounds: 1 });

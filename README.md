@@ -275,7 +275,7 @@ import { NegotiationServer, type ServerPlugin } from "http-negotiation-protocol/
 const timing: ServerPlugin = {
   name: "timing",
   onCallStart: ({ jobId, path }) => console.log(`job ${jobId} started on ${path}`),
-  onRound:    ({ round, actions }) => console.log(`round ${round}: ${actions.map((a) => a.name).join(", ")}`),
+  onRound:    ({ round }) => console.log(`round ${round}`),
   onCallEnd:   ({ result }) => console.log("finished:", result),
   onCallError: ({ error }) => console.error("failed:", error.message),
 };
@@ -285,13 +285,20 @@ server.plugin(timing); // or server.plugin([timing, anotherPlugin])
 ```
 
 Every hook receives the job context (`jobId`, `path`, `method`, `origin`,
-`round`, `startedAt`, `request`); `onRound` adds the round's `actions`,
-`onCallEnd` the final `result`, and `onCallError` the `error`. Error semantics
+`round`, `startedAt`, `request`); `onCallEnd` adds the final `result`, and
+`onCallError` the `error`. Error semantics
 mirror middleware: throwing from `onCallStart`/`onRound` **fails the job**
 (the client receives the error and `onCallError` fires), while throwing from
 `onCallEnd`/`onCallError` is only reported through the server's `onError`
 option and never changes the outcome. The client has the symmetric HTTP
 plugin API (`client.use({ onRequest, onResponse, onError })`).
+
+**Ask privacy:** plugins cannot observe or intercept asks/responseAsks.
+`onRound` never carries the asked actions; client plugins receive resume
+requests with the results body redacted (they may still time, header, or
+halt them, but cannot see service results), and negotiation envelopes
+shown to `onResponse` have their `actions` stripped. Asks travel and
+execute with no plugin visibility on either side.
 
 > The earlier names `onJobStart`/`onJobEnd`/`onJobError` and
 > `onNegotiationStart`/`onNegotiationEnd`/`onNegotiationError` still work

@@ -132,10 +132,12 @@ export interface ServerPluginCall {
 /** @deprecated Use `ServerPluginCall`. */
 export type ServerPluginJob = ServerPluginCall;
 
-/** Passed to `onRound`: one batch of client services issued in a single round. */
-export interface ServerPluginCallRound extends ServerPluginCall {
-  actions: ClientAction[];
-}
+/**
+ * Passed to `onRound`: a negotiation round was issued. Deliberately carries
+ * NO ask details: plugins cannot observe (or intercept) asks/responseAsks —
+ * neither the asked service names nor their data appear here.
+ */
+export type ServerPluginCallRound = ServerPluginCall;
 
 /** @deprecated Use `ServerPluginCallRound`. */
 export type ServerPluginRound = ServerPluginCallRound;

@@ -31,7 +31,7 @@ function recorder(events: string[]): ServerPlugin {
       events.push(`start:${job.path}:round${job.round}`);
     },
     onRound: (round) => {
-      events.push(`round${round.round}:${round.actions.map((a) => a.name).join("+")}`);
+      events.push(`round${round.round}`);
     },
     onCallEnd: (job) => {
       events.push(`end:${JSON.stringify(job.result)}`);
@@ -64,8 +64,8 @@ test("server plugins observe start, every round, and successful end in order", a
 
   assert.deepEqual(events, [
     "start:/example:round0",
-    "round1:getName",
-    "round2:getCity",
+    "round1",
+    "round2",
     'end:{"name":"Alex","city":"Graz"}',
   ]);
 });
